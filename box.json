@@ -35,7 +35,8 @@
         "testbox":"testbox/"
     },
     "scripts":{
-        "preVersion":"!boxlang run-tests.bxs"
+        "preVersion":"!boxlang run-tests.bxs",
+        "postPublish":"!git push --follow-tags && bash scripts/release.sh"
     },
     "ignore":[
         "**/.*",
@@ -43,6 +44,7 @@
         "testbox/**",
         "boxlang_modules/**",
         "run-tests.bxs",
-        "setup-tests.bxs"
+        "setup-tests.bxs",
+        "scripts/**"
     ]
 }
