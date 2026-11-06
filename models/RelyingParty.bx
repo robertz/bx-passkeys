@@ -1,0 +1,409 @@
+/**
+ * The server half of WebAuthn passkeys, with attestation "none" and JDK crypto only.
+ *
+ * Registration takes the new key either as SPKI (the browser's
+ * AuthenticatorAttestationResponse.getPublicKey()) or from the COSE key inside
+ * attestationObject. A sign-in is the authenticator's signature over
+ * authenticatorData + SHA-256(clientDataJSON), checked with java.security.Signature.
+ * Each challenge lives in a session struct the caller passes in, and is good for
+ * one try within challengeSeconds.
+ */
+class {
+
+	property name="settings";
+	property name="store";
+
+	static {
+		SUPPORTED = { "-7": { key: "EC", signature: "SHA256withECDSA" }, "-8": { key: "Ed25519", signature: "Ed25519" }, "-257": { key: "RSA", signature: "SHA256withRSA" } }
+		FLAG_USER_PRESENT = 1
+		FLAG_USER_VERIFIED = 4
+		FLAG_ATTESTED = 64
+		DEFAULTS = {
+			rpId             : "localhost",
+			rpName           : "",
+			origins          : [],
+			challengeSeconds : 300,
+			algorithms       : [ -7, -8, -257 ],
+			userVerification : "preferred",
+			residentKey      : "required",
+			maxPerUser       : 0,
+			sessionKey       : "passkeyChallenge"
+		}
+	}
+
+	/**
+	 * settings: see DEFAULTS and the README. store: a CredentialStore.
+	 */
+	function init( required struct settings, required store ) {
+		variables.settings = duplicate( static.DEFAULTS ).append( arguments.settings )
+		variables.store = arguments.store
+		variables.settings.rpId = lcase( trim( variables.settings.rpId ) )
+		if ( !len( variables.settings.rpId ) ) {
+			throw( type = "Passkeys.Configuration", message = "rpId is required" )
+		}
+		if ( !len( variables.settings.rpName ) ) {
+			variables.settings.rpName = variables.settings.rpId
+		}
+		if ( isSimpleValue( variables.settings.origins ) ) {
+			variables.settings.origins = listToArray( variables.settings.origins )
+		}
+		variables.settings.origins = variables.settings.origins.map( ( o ) => lcase( reReplace( trim( o ), "/+$", "" ) ) )
+		variables.settings.algorithms = variables.settings.algorithms.map( ( a ) => toString( int( a ) ) )
+		for ( var alg in variables.settings.algorithms ) {
+			if ( !static.SUPPORTED.keyExists( alg ) ) {
+				throw( type = "Passkeys.Configuration", message = "Algorithm #alg# isn't supported; use -7, -8 or -257" )
+			}
+		}
+		variables.cbor = new Cbor()
+		variables.cose = new CoseKey()
+		return this
+	}
+
+	/**
+	 * PublicKeyCredentialCreationOptionsJSON for a new passkey.
+	 * user: { id, name, displayName? }. id is your app's user id; it's handed to the
+	 * authenticator as its UTF-8 bytes, so keep names and emails out of it.
+	 */
+	struct function registrationOptions( required struct user, required struct sessionData ) {
+		var userId = userIdOf( arguments.user )
+		var existing = variables.store.listForUser( userId )
+		if ( variables.settings.maxPerUser > 0 && existing.len() >= variables.settings.maxPerUser ) {
+			invalid( "That's as many passkeys as an account can have. Remove one first." )
+		}
+		var name = toString( arguments.user.name ?: userId )
+		var display = toString( arguments.user.displayName ?: "" )
+		return {
+			challenge              : newChallenge( arguments.sessionData, "register", userId ),
+			rp                     : { id: variables.settings.rpId, name: variables.settings.rpName },
+			user                   : { id: encode( userId.getBytes( "UTF-8" ) ), name: name, displayName: len( display ) ? display : name },
+			pubKeyCredParams       : variables.settings.algorithms.map( ( alg ) => { return { type: "public-key", alg: val( alg ) } } ),
+			timeout                : variables.settings.challengeSeconds * 1000,
+			attestation            : "none",
+			authenticatorSelection : {
+				residentKey        : variables.settings.residentKey,
+				requireResidentKey : variables.settings.residentKey == "required",
+				userVerification   : variables.settings.userVerification
+			},
+			excludeCredentials : existing.map( ( c ) => descriptor( c ) )
+		}
+	}
+
+	/**
+	 * Checks the browser's answer and saves the new passkey; returns its credential struct.
+	 * answer: { id, clientDataJSON, attestationObject?, authenticatorData?, publicKey?,
+	 * publicKeyAlgorithm?, transports?: [], name? }, binary fields base64url. It needs
+	 * attestationObject, or authenticatorData with publicKey and publicKeyAlgorithm.
+	 * Throws Passkeys.Invalid.
+	 */
+	struct function register( required struct user, required struct sessionData, required struct answer ) {
+		var userId = userIdOf( arguments.user )
+		var held = takeChallenge( arguments.sessionData, "register" )
+		if ( compare( held.userId, userId ) != 0 ) {
+			invalid( "That answer is for another account. Try again." )
+		}
+		var credentialId = requireField( arguments.answer, "id" )
+		checkClientData( decodeField( arguments.answer, "clientDataJSON" ), "webauthn.create", held.value )
+
+		var attested = {}
+		if ( len( arguments.answer.attestationObject ?: "" ) ) {
+			var attestation = variables.cbor.decode( decodeField( arguments.answer, "attestationObject" ) )
+			if ( !isStruct( attestation ) || !isBinary( attestation.authData ?: "" ) ) {
+				invalid( "The authenticator's answer can't be read" )
+			}
+			attested.authData = attestation.authData
+			if ( len( arguments.answer.authenticatorData ?: "" ) && !sameBytes( attested.authData, decodeField( arguments.answer, "authenticatorData" ) ) ) {
+				invalid( "The authenticator's answer doesn't add up" )
+			}
+		} else {
+			attested.authData = decodeField( arguments.answer, "authenticatorData" )
+		}
+		var authData = attested.authData
+		var buffer = checkAuthData( authData )
+		if ( !bitAnd( buffer.get( 32 ), static.FLAG_ATTESTED ) || len( authData ) < 55 ) {
+			invalid( "That passkey came without its key" )
+		}
+		var idLength = createObject( "java", "java.lang.Short" ).toUnsignedInt( buffer.getShort( 53 ) )
+		if ( len( authData ) < 55 + idLength || !sameBytes( slice( authData, 55, 55 + idLength ), decode( credentialId ) ) ) {
+			invalid( "That passkey's id doesn't match" )
+		}
+
+		var key = {}
+		if ( len( arguments.answer.publicKey ?: "" ) ) {
+			key = { algorithm: toString( arguments.answer.publicKeyAlgorithm ?: "" ), spki: requireField( arguments.answer, "publicKey" ) }
+		}
+		if ( len( authData ) > 55 + idLength ) {
+			var coseItem = variables.cbor.decodeAt( authData, 55 + idLength )
+			if ( !isStruct( coseItem.value ) ) {
+				invalid( "That passkey's key can't be read" )
+			}
+			var fromCose = variables.cose.toSpki( coseItem.value )
+			if ( key.isEmpty() ) {
+				key = { algorithm: toString( fromCose.algorithm ), spki: encode( fromCose.spki ) }
+			} else if ( key.algorithm != toString( fromCose.algorithm ) || !sameBytes( decode( key.spki ), fromCose.spki ) ) {
+				invalid( "That passkey's key doesn't match the authenticator's" )
+			}
+		}
+		if ( key.isEmpty() ) {
+			invalid( "That passkey came without its key" )
+		}
+		if ( !variables.settings.algorithms.contains( key.algorithm ) ) {
+			invalid( "That passkey uses a kind of key this site doesn't take" )
+		}
+		publicKeyOf( key.spki, key.algorithm )
+
+		var found = variables.store.findByCredentialId( credentialId )
+		if ( !isNull( found ) ) {
+			if ( compare( toString( found.userId ), userId ) != 0 ) {
+				invalid( "That passkey is already in use" )
+			}
+			return found
+		}
+		var transports = isArray( arguments.answer.transports ?: "" ) ? arguments.answer.transports.filter( ( t ) => isSimpleValue( t ) && reFind( "^[a-z-]{1,20}$", t ) ) : []
+		var typed = isSimpleValue( arguments.answer.name ?: "" ) ? trim( arguments.answer.name ?: "" ) : ""
+		var credential = {
+			credentialId : credentialId,
+			userId       : userId,
+			publicKey    : key.spki,
+			algorithm    : val( key.algorithm ),
+			signCount    : createObject( "java", "java.lang.Integer" ).toUnsignedLong( buffer.getInt( 33 ) ),
+			transports   : transports,
+			name         : len( typed ) ? left( typed, 100 ) : "Passkey",
+			createdAt    : now(),
+			lastUsedAt   : javacast( "null", "" )
+		}
+		variables.store.add( credential )
+		return credential
+	}
+
+	/**
+	 * PublicKeyCredentialRequestOptionsJSON. With a userId only that user's passkeys
+	 * are offered (re-confirming who's signed in); without one the browser offers
+	 * whichever of this site's discoverable passkeys it has.
+	 */
+	struct function signInOptions( required struct sessionData, string userId = "" ) {
+		var allowed = len( arguments.userId ) ? variables.store.listForUser( arguments.userId ).map( ( c ) => descriptor( c ) ) : []
+		return {
+			challenge        : newChallenge( arguments.sessionData, "sign-in", arguments.userId ),
+			rpId             : variables.settings.rpId,
+			timeout          : variables.settings.challengeSeconds * 1000,
+			userVerification : variables.settings.userVerification,
+			allowCredentials : allowed
+		}
+	}
+
+	/**
+	 * Checks a sign-in answer: { id, clientDataJSON, authenticatorData, signature, userHandle? }
+	 * (base64url). Returns { userId, credentialId, userVerified, signCount, credential }.
+	 * When the options were made for a userId, the passkey must be theirs.
+	 * Throws Passkeys.Invalid for anything that doesn't check out.
+	 */
+	struct function verify( required struct sessionData, required struct answer ) {
+		var held = takeChallenge( arguments.sessionData, "sign-in" )
+		var credential = variables.store.findByCredentialId( requireField( arguments.answer, "id" ) )
+		if ( isNull( credential ) ) {
+			invalid( "That passkey isn't one this site knows. It may have been removed." )
+		}
+		var userId = toString( credential.userId )
+		if ( len( held.userId ) && compare( held.userId, userId ) != 0 ) {
+			invalid( "That passkey belongs to another account" )
+		}
+		if ( len( arguments.answer.userHandle ?: "" ) ) {
+			var handle = createObject( "java", "java.lang.String" ).init( decodeField( arguments.answer, "userHandle" ), "UTF-8" )
+			if ( compare( handle, userId ) != 0 ) {
+				invalid( "That passkey belongs to another account" )
+			}
+		}
+		var clientData = decodeField( arguments.answer, "clientDataJSON" )
+		checkClientData( clientData, "webauthn.get", held.value )
+		var authData = decodeField( arguments.answer, "authenticatorData" )
+		var buffer = checkAuthData( authData )
+
+		var signed = createObject( "java", "java.io.ByteArrayOutputStream" ).init()
+		signed.write( authData )
+		signed.write( sha256( clientData ) )
+		var algorithm = toString( credential.algorithm )
+		if ( !static.SUPPORTED.keyExists( algorithm ) ) {
+			invalid( "That passkey uses a kind of key this site doesn't take" )
+		}
+		var check = createObject( "java", "java.security.Signature" ).getInstance( static.SUPPORTED[ algorithm ].signature )
+		check.initVerify( publicKeyOf( credential.publicKey, algorithm ) )
+		check.update( signed.toByteArray() )
+		var good = false
+		try {
+			good = check.verify( decodeField( arguments.answer, "signature" ) )
+		} catch ( "Passkeys.Invalid" e ) {
+			rethrow;
+		} catch ( any e ) {
+			good = false
+		}
+		if ( !good ) {
+			invalid( "That passkey's signature doesn't check out" )
+		}
+
+		// a counter that goes backwards means the key was cloned; most passkeys keep 0
+		var counter = createObject( "java", "java.lang.Integer" ).toUnsignedLong( buffer.getInt( 33 ) )
+		if ( counter > 0 && credential.signCount > 0 && counter <= credential.signCount ) {
+			invalid( "That passkey looks copied. Remove it and add it again." )
+		}
+		var usedAt = now()
+		variables.store.updateUsage( credential.credentialId, counter, usedAt )
+		credential.signCount = counter
+		credential.lastUsedAt = usedAt
+		return {
+			userId       : userId,
+			credentialId : credential.credentialId,
+			userVerified : bitAnd( buffer.get( 32 ), static.FLAG_USER_VERIFIED ) > 0,
+			signCount    : counter,
+			credential   : credential
+		}
+	}
+
+	boolean function originAllowed( required string origin ) {
+		var given = lcase( arguments.origin )
+		if ( variables.settings.origins.len() ) {
+			return variables.settings.origins.contains( given )
+		}
+		var found = reFind( "^(https?)://([^/:]+)(:[0-9]+)?$", given, 1, true )
+		if ( !found.pos[ 1 ] ) {
+			return false
+		}
+		var scheme = found.match[ 2 ]
+		var host = found.match[ 3 ]
+		var rpId = variables.settings.rpId
+		if ( host != rpId && !host.endsWith( "." & rpId ) ) {
+			return false
+		}
+		return scheme == "https" || host == "localhost"
+	}
+
+	private struct function descriptor( required struct credential ) {
+		return { type: "public-key", id: arguments.credential.credentialId, transports: arguments.credential.transports ?: [] }
+	}
+
+	private string function userIdOf( required struct user ) {
+		var id = arguments.user.id ?: ""
+		if ( !isSimpleValue( id ) || !len( toString( id ) ) || len( toString( id ).getBytes( "UTF-8" ) ) > 64 ) {
+			throw( type = "Passkeys.Configuration", message = "user.id must be 1 to 64 bytes" )
+		}
+		return toString( id )
+	}
+
+	private string function newChallenge( required struct sessionData, required string purpose, required string userId ) {
+		var bytes = createObject( "java", "java.nio.ByteBuffer" ).allocate( 32 ).array()
+		createObject( "java", "java.security.SecureRandom" ).init().nextBytes( bytes )
+		var value = encode( bytes )
+		arguments.sessionData[ variables.settings.sessionKey ] = {
+			value   : value,
+			purpose : arguments.purpose,
+			userId  : arguments.userId,
+			expires : now().getTime() + variables.settings.challengeSeconds * 1000
+		}
+		return value
+	}
+
+	/** The session's challenge for this purpose, used up whatever happens next. */
+	private struct function takeChallenge( required struct sessionData, required string purpose ) {
+		var held = arguments.sessionData[ variables.settings.sessionKey ] ?: {}
+		structDelete( arguments.sessionData, variables.settings.sessionKey )
+		if ( !isStruct( held ) || ( held.purpose ?: "" ) != arguments.purpose ) {
+			invalid( "That answer was already used, or never asked for. Try again." )
+		}
+		if ( ( held.expires ?: 0 ) < now().getTime() ) {
+			invalid( "That took too long. Try again." )
+		}
+		return held
+	}
+
+	private void function checkClientData( required clientData, required string type, required string challenge ) {
+		var parsed = {}
+		try {
+			parsed = jsonDeserialize( createObject( "java", "java.lang.String" ).init( arguments.clientData, "UTF-8" ) )
+		} catch ( any e ) {
+			invalid( "The browser's answer can't be read" )
+		}
+		if ( !isStruct( parsed ) || ( parsed.type ?: "" ) != arguments.type ) {
+			invalid( "The browser's answer is for something else" )
+		}
+		if ( compare( parsed.challenge ?: "", arguments.challenge ) != 0 ) {
+			invalid( "That answer is for another try. Try again." )
+		}
+		if ( !originAllowed( parsed.origin ?: "" ) ) {
+			invalid( "That passkey was used on another site" )
+		}
+		if ( ( parsed.crossOrigin ?: false ) == true ) {
+			invalid( "That passkey was used inside another site's frame" )
+		}
+	}
+
+	/** A ByteBuffer over authenticatorData once its site, presence and verification check out. */
+	private function checkAuthData( required authData ) {
+		if ( len( arguments.authData ) < 37 ) {
+			invalid( "The authenticator's answer is too short" )
+		}
+		if ( !sameBytes( slice( arguments.authData, 0, 32 ), sha256( variables.settings.rpId.getBytes( "UTF-8" ) ) ) ) {
+			invalid( "That passkey is for another site" )
+		}
+		var buffer = createObject( "java", "java.nio.ByteBuffer" ).wrap( arguments.authData )
+		var flags = buffer.get( 32 )
+		if ( !bitAnd( flags, static.FLAG_USER_PRESENT ) ) {
+			invalid( "The authenticator didn't confirm you were there" )
+		}
+		if ( variables.settings.userVerification == "required" && !bitAnd( flags, static.FLAG_USER_VERIFIED ) ) {
+			invalid( "The authenticator didn't confirm it was you" )
+		}
+		return buffer
+	}
+
+	private function publicKeyOf( required string spki, required string algorithm ) {
+		try {
+			return createObject( "java", "java.security.KeyFactory" )
+				.getInstance( static.SUPPORTED[ arguments.algorithm ].key )
+				.generatePublic( createObject( "java", "java.security.spec.X509EncodedKeySpec" ).init( decode( arguments.spki ) ) )
+		} catch ( "Passkeys.Invalid" e ) {
+			rethrow;
+		} catch ( any e ) {
+			invalid( "That passkey's key can't be read" )
+		}
+	}
+
+	private string function requireField( required struct answer, required string name ) {
+		var value = arguments.answer[ arguments.name ] ?: ""
+		if ( !isSimpleValue( value ) || !len( value ) || len( value ) > 8000 ) {
+			invalid( "The browser's answer is missing #arguments.name#" )
+		}
+		return value
+	}
+
+	private function decodeField( required struct answer, required string name ) {
+		return decode( requireField( arguments.answer, arguments.name ) )
+	}
+
+	private function decode( required string value ) {
+		try {
+			return createObject( "java", "java.util.Base64" ).getUrlDecoder().decode( arguments.value.replace( "=", "", "all" ) )
+		} catch ( any e ) {
+			invalid( "The browser's answer can't be read" )
+		}
+	}
+
+	private string function encode( required bytes ) {
+		return createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding().encodeToString( arguments.bytes )
+	}
+
+	private function sha256( required bytes ) {
+		return createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" ).digest( arguments.bytes )
+	}
+
+	private function slice( required bytes, required numeric from, required numeric to ) {
+		return createObject( "java", "java.util.Arrays" ).copyOfRange( arguments.bytes, javacast( "int", arguments.from ), javacast( "int", arguments.to ) )
+	}
+
+	private boolean function sameBytes( required a, required b ) {
+		return createObject( "java", "java.security.MessageDigest" ).isEqual( arguments.a, arguments.b )
+	}
+
+	private void function invalid( required string message ) {
+		throw( type = "Passkeys.Invalid", message = arguments.message )
+	}
+
+}

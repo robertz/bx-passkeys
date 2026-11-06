@@ -1,0 +1,18 @@
+/**
+ * Once per checkout: links boxlang_modules/bxPasskeys to this folder so BoxLang
+ * loads the project as a module (bxModules.bxPasskeys mapping, passkeyRelyingParty BIF).
+ * A separate script because modules are discovered at startup.
+ *
+ *   boxlang setup-tests.bxs
+ *   boxlang run-tests.bxs
+ */
+paths = createObject( "java", "java.nio.file.Paths" )
+files = createObject( "java", "java.nio.file.Files" )
+linkPath = paths.get( expandPath( "boxlang_modules/bxPasskeys" ) )
+if ( files.exists( linkPath, [] ) ) {
+	println( "boxlang_modules/bxPasskeys already set up." )
+} else {
+	files.createDirectories( paths.get( expandPath( "boxlang_modules" ) ) )
+	files.createSymbolicLink( linkPath, paths.get( ".." ) )
+	println( "Created boxlang_modules/bxPasskeys. Run `boxlang run-tests.bxs` now." )
+}

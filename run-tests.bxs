@@ -1,0 +1,16 @@
+/**
+ * Runs the specs headlessly and exits non-zero on any failure or error.
+ *   boxlang run-tests.bxs
+ */
+if ( !createObject( "java", "java.nio.file.Files" ).exists( createObject( "java", "java.nio.file.Paths" ).get( expandPath( "boxlang_modules/bxPasskeys" ) ), [] ) ) {
+	println( "Run `boxlang setup-tests.bxs` first, then this again." )
+	createObject( "java", "java.lang.System" ).exit( 1 )
+}
+
+tb = new "testbox.system.TestBox"( directory = "tests.specs", reporter = "text" )
+println( tb.run() )
+
+result = tb.getResult()
+if ( result.getTotalFail() > 0 || result.getTotalError() > 0 ) {
+	createObject( "java", "java.lang.System" ).exit( 1 )
+}

@@ -1,0 +1,27 @@
+/**
+ * Registering a passkey and signing in with it, end to end, with the spec
+ * suite's FakeAuthenticator standing in for the browser.
+ *   boxlang setup-tests.bxs && boxlang examples/flow.bxs
+ */
+rp = passkeyRelyingParty( { rpId: "localhost", rpName: "Example" }, new bxModules.bxPasskeys.models.MemoryCredentialStore() )
+browser = new tests.helpers.FakeAuthenticator( origin = "http://localhost:8080" )
+user = { id: "1001", name: "alice@example.com", displayName: "Alice" }
+
+// 1. Signed in some other way, Alice adds a passkey.
+sessionData = {}
+creationOptions = rp.registrationOptions( user, sessionData )
+saved = rp.register( user, sessionData, browser.create( creationOptions ) )
+println( "Added #saved.name# (#saved.credentialId#) for user #saved.userId#" )
+
+// 2. Later, a fresh session signs in with it, no username needed.
+sessionData = {}
+requestOptions = rp.signInOptions( sessionData )
+result = rp.verify( sessionData, browser.get( requestOptions ) )
+println( "Signed in as user #result.userId#, verified: #result.userVerified#" )
+
+// 3. A replayed answer is refused: the challenge was used up.
+try {
+	rp.verify( sessionData, browser.get( requestOptions ) )
+} catch ( "Passkeys.Invalid" e ) {
+	println( "Replay refused: #e.message#" )
+}

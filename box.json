@@ -1,0 +1,48 @@
+{
+    "name":"BxPasskeys",
+    "version":"0.1.0",
+    "author":"Robert Zehnder",
+    "slug":"bx-passkeys",
+    "shortDescription":"WebAuthn passkeys for BoxLang: registration and sign-in with JDK crypto only, attestation none.",
+    "type":"boxlang-modules",
+    "keywords":[
+        "boxlang",
+        "webauthn",
+        "passkeys",
+        "fido2",
+        "authentication"
+    ],
+    "homepage":"https://github.com/robertz/bx-passkeys",
+    "repository":{
+        "type":"git",
+        "URL":"https://github.com/robertz/bx-passkeys"
+    },
+    "boxlang":{
+        "minimumVersion":"1.19.0",
+        "moduleName":"bxPasskeys"
+    },
+    "private":false,
+    "license":[
+        {
+            "type":"MIT",
+            "URL":"https://opensource.org/licenses/MIT"
+        }
+    ],
+    "devDependencies":{
+        "testbox":"^7.0.0"
+    },
+    "installPaths":{
+        "testbox":"testbox/"
+    },
+    "scripts":{
+        "preVersion":"!boxlang run-tests.bxs"
+    },
+    "ignore":[
+        "**/.*",
+        "tests/**",
+        "testbox/**",
+        "boxlang_modules/**",
+        "run-tests.bxs",
+        "setup-tests.bxs"
+    ]
+}

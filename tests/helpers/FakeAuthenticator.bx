@@ -1,0 +1,237 @@
+/**
+ * A passkey authenticator for specs: answers navigator.credentials.create() and
+ * .get() options as a browser would (binary fields base64url), with an ES256,
+ * Ed25519 or RS256 key. Registration answers carry both attestationObject (fmt
+ * "none", COSE key inside) and the SPKI publicKey, so either path can be tested.
+ */
+class {
+
+	property name="keys";
+	property name="credentialId" type="string";
+	property name="counter" type="numeric";
+	property name="origin" type="string";
+	property name="rpId" type="string";
+	property name="algorithm" type="numeric";
+	property name="userHandle" type="string";
+
+	function init( string origin = "http://localhost:5173", string rpId = "localhost", numeric algorithm = -7 ) {
+		variables.algorithm = arguments.algorithm
+		var generator = ""
+		if ( arguments.algorithm == -8 ) {
+			generator = createObject( "java", "java.security.KeyPairGenerator" ).getInstance( "Ed25519" )
+		} else if ( arguments.algorithm == -257 ) {
+			generator = createObject( "java", "java.security.KeyPairGenerator" ).getInstance( "RSA" )
+			generator.initialize( 2048 )
+		} else {
+			generator = createObject( "java", "java.security.KeyPairGenerator" ).getInstance( "EC" )
+			generator.initialize( createObject( "java", "java.security.spec.ECGenParameterSpec" ).init( "secp256r1" ) )
+		}
+		variables.keys = generator.generateKeyPair()
+		var id = createObject( "java", "java.nio.ByteBuffer" ).allocate( 16 ).array()
+		createObject( "java", "java.security.SecureRandom" ).init().nextBytes( id )
+		variables.credentialId = encode( id )
+		variables.counter = 0
+		variables.origin = arguments.origin
+		variables.rpId = arguments.rpId
+		variables.userHandle = ""
+		return this
+	}
+
+	/** The answer to registration options; `changes` overrides any of its fields (a null value drops it). */
+	struct function create( required struct options, struct changes = {} ) {
+		var id = decode( variables.credentialId )
+		variables.userHandle = arguments.options.user.id
+		var data = bytesOf( [
+			sha256( variables.rpId.getBytes( "UTF-8" ) ),
+			// user present and verified, attested credential data follows
+			[ 69 ],
+			int32( variables.counter ),
+			createObject( "java", "java.nio.ByteBuffer" ).allocate( 16 ).array(),
+			int16( arrayLen( id ) ),
+			id,
+			cbor( coseKey() )
+		] )
+		var answer = {
+			id                 : variables.credentialId,
+			clientDataJSON     : encode( clientData( "webauthn.create", arguments.options.challenge ).getBytes( "UTF-8" ) ),
+			attestationObject  : encode( cbor( structNew( "ordered" ).append( { fmt: "none", attStmt: {}, authData: data } ) ) ),
+			authenticatorData  : encode( data ),
+			publicKey          : encode( variables.keys.getPublic().getEncoded() ),
+			publicKeyAlgorithm : variables.algorithm,
+			transports         : [ "internal" ],
+			name               : "Test key"
+		}
+		for ( var key in arguments.changes ) {
+			if ( isNull( arguments.changes[ key ] ) ) {
+				answer.delete( key )
+			} else {
+				answer[ key ] = arguments.changes[ key ]
+			}
+		}
+		return answer
+	}
+
+	/** The answer to sign-in options, signed with this key (or with `signer`, another authenticator's). */
+	struct function get( required struct options, string type = "webauthn.get", signer = this, numeric flags = 5 ) {
+		variables.counter++
+		var json = clientData( arguments.type, arguments.options.challenge ).getBytes( "UTF-8" )
+		var data = bytesOf( [ sha256( variables.rpId.getBytes( "UTF-8" ) ), [ arguments.flags ], int32( variables.counter ) ] )
+		var answer = {
+			id                : variables.credentialId,
+			clientDataJSON    : encode( json ),
+			authenticatorData : encode( data ),
+			signature         : encode( arguments.signer.sign( bytesOf( [ data, sha256( json ) ] ) ) )
+		}
+		if ( len( variables.userHandle ) ) {
+			answer.userHandle = variables.userHandle
+		}
+		return answer
+	}
+
+	function sign( required bytes ) {
+		var signer = createObject( "java", "java.security.Signature" ).getInstance( signatureName() )
+		signer.initSign( variables.keys.getPrivate() )
+		signer.update( arguments.bytes )
+		return signer.sign()
+	}
+
+	function setOrigin( required string origin ) {
+		variables.origin = arguments.origin
+		return this
+	}
+
+	function setCounter( required numeric counter ) {
+		variables.counter = arguments.counter
+		return this
+	}
+
+	/** The public key as a COSE_Key map, keys as numeric strings. */
+	struct function coseKey() {
+		var key = variables.keys.getPublic()
+		if ( variables.algorithm == -8 ) {
+			var spki = key.getEncoded()
+			return structNew( "ordered" ).append( { "1": 1, "3": -8, "-1": 6, "-2": slice( spki, arrayLen( spki ) - 32, arrayLen( spki ) ) } )
+		}
+		if ( variables.algorithm == -257 ) {
+			return structNew( "ordered" ).append( { "1": 3, "3": -257, "-1": unsigned( key.getModulus(), 0 ), "-2": unsigned( key.getPublicExponent(), 0 ) } )
+		}
+		return structNew( "ordered" ).append( { "1": 2, "3": -7, "-1": 1, "-2": unsigned( key.getW().getAffineX(), 32 ), "-3": unsigned( key.getW().getAffineY(), 32 ) } )
+	}
+
+	/** Minimal CBOR encoder: integers, byte strings, text, arrays, maps (numeric-string keys become integers). */
+	function cbor( required value ) {
+		var out = createObject( "java", "java.io.ByteArrayOutputStream" ).init()
+		writeItem( out, arguments.value )
+		return out.toByteArray()
+	}
+
+	private void function writeItem( required out, required value ) {
+		if ( isBinary( arguments.value ) ) {
+			writeHead( arguments.out, 2, arrayLen( arguments.value ) )
+			arguments.out.write( arguments.value )
+		} else if ( isStruct( arguments.value ) ) {
+			writeHead( arguments.out, 5, structCount( arguments.value ) )
+			for ( var key in arguments.value ) {
+				writeItem( arguments.out, reFind( "^-?[0-9]+$", key ) ? int( key ) : key )
+				writeItem( arguments.out, arguments.value[ key ] )
+			}
+		} else if ( isArray( arguments.value ) ) {
+			writeHead( arguments.out, 4, arrayLen( arguments.value ) )
+			for ( var item in arguments.value ) {
+				writeItem( arguments.out, item )
+			}
+		} else if ( isNumeric( arguments.value ) && reFind( "^-?[0-9]+$", toString( arguments.value ) ) ) {
+			if ( arguments.value < 0 ) {
+				writeHead( arguments.out, 1, -1 - arguments.value )
+			} else {
+				writeHead( arguments.out, 0, arguments.value )
+			}
+		} else {
+			var text = toString( arguments.value ).getBytes( "UTF-8" )
+			writeHead( arguments.out, 3, arrayLen( text ) )
+			arguments.out.write( text )
+		}
+	}
+
+	private void function writeHead( required out, required numeric major, required numeric size ) {
+		var lead = arguments.major * 32
+		if ( arguments.size < 24 ) {
+			arguments.out.write( javacast( "int", lead + arguments.size ) )
+		} else if ( arguments.size < 256 ) {
+			arguments.out.write( javacast( "int", lead + 24 ) )
+			arguments.out.write( javacast( "int", arguments.size ) )
+		} else if ( arguments.size < 65536 ) {
+			arguments.out.write( javacast( "int", lead + 25 ) )
+			arguments.out.write( int16( arguments.size ) )
+		} else {
+			arguments.out.write( javacast( "int", lead + 26 ) )
+			arguments.out.write( int32( arguments.size ) )
+		}
+	}
+
+	private string function signatureName() {
+		if ( variables.algorithm == -8 ) {
+			return "Ed25519"
+		}
+		return variables.algorithm == -257 ? "SHA256withRSA" : "SHA256withECDSA"
+	}
+
+	/** A BigInteger's magnitude, left-padded to `size` bytes when size > 0. */
+	private function unsigned( required number, required numeric size ) {
+		var raw = arguments.number.toByteArray()
+		var magnitude = ceiling( arguments.number.bitLength() / 8 )
+		if ( arrayLen( raw ) > magnitude ) {
+			raw = slice( raw, arrayLen( raw ) - magnitude, arrayLen( raw ) )
+		}
+		if ( arguments.size == 0 || arrayLen( raw ) == arguments.size ) {
+			return raw
+		}
+		var padded = createObject( "java", "java.nio.ByteBuffer" ).allocate( javacast( "int", arguments.size ) )
+		padded.position( javacast( "int", arguments.size - arrayLen( raw ) ) )
+		padded.put( raw )
+		return padded.array()
+	}
+
+	private string function clientData( required string type, required string challenge ) {
+		return '{"type":"#arguments.type#","challenge":"#arguments.challenge#","origin":"#variables.origin#","crossOrigin":false}'
+	}
+
+	private function bytesOf( required array parts ) {
+		var out = createObject( "java", "java.io.ByteArrayOutputStream" ).init()
+		for ( var part in arguments.parts ) {
+			if ( isBinary( part ) ) {
+				out.write( part )
+			} else {
+				for ( var b in part ) {
+					out.write( javacast( "int", b ) )
+				}
+			}
+		}
+		return out.toByteArray()
+	}
+
+	private function slice( required bytes, required numeric from, required numeric to ) {
+		return createObject( "java", "java.util.Arrays" ).copyOfRange( arguments.bytes, javacast( "int", arguments.from ), javacast( "int", arguments.to ) )
+	}
+
+	private function int32( required numeric value ) {
+		return createObject( "java", "java.nio.ByteBuffer" ).allocate( 4 ).putInt( javacast( "int", arguments.value ) ).array()
+	}
+
+	private function int16( required numeric value ) {
+		return createObject( "java", "java.nio.ByteBuffer" ).allocate( 2 ).putShort( javacast( "short", arguments.value ) ).array()
+	}
+
+	private function sha256( required bytes ) {
+		return createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" ).digest( arguments.bytes )
+	}
+
+	private string function encode( required bytes ) {
+		return createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding().encodeToString( arguments.bytes )
+	}
+
+	private function decode( required string value ) {
+		return createObject( "java", "java.util.Base64" ).getUrlDecoder().decode( arguments.value )
+	}
+
+}

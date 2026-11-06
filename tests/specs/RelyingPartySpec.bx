@@ -1,0 +1,289 @@
+import tests.helpers.FakeAuthenticator;
+
+/** Registering passkeys and signing in with them, and every answer that must be refused. */
+class extends="testbox.system.BaseSpec" {
+
+	private function party( struct settings = {}, store ) {
+		return new bxModules.bxPasskeys.models.RelyingParty(
+			{ rpId: "localhost", rpName: "Spec" }.append( arguments.settings ),
+			arguments.store ?: new bxModules.bxPasskeys.models.MemoryCredentialStore()
+		)
+	}
+
+	private struct function enrol( required rp, required key, struct user = { id: "1", name: "alice" }, struct changes = {} ) {
+		var sessionData = {}
+		var options = arguments.rp.registrationOptions( arguments.user, sessionData )
+		return arguments.rp.register( arguments.user, sessionData, arguments.key.create( options, arguments.changes ) )
+	}
+
+	private function refused( required rp, required struct sessionData, required struct answer, string message = "" ) {
+		var expected = arguments.message
+		var target = arguments.rp
+		var sessionData = arguments.sessionData
+		var answer = arguments.answer
+		expect( () => target.verify( sessionData, answer ) ).toThrow( "Passkeys.Invalid", expected )
+	}
+
+	function run() {
+
+		describe( "Registration options", () => {
+
+			it( "asks for attestation none, the configured algorithms, and the user's id as bytes", () => {
+				var rp = party( { algorithms: [ -8, -7 ], rpName: "Example" } )
+				var sessionData = {}
+				var options = rp.registrationOptions( { id: 42, name: "alice", displayName: "Alice A." }, sessionData )
+				expect( options.rp ).toBe( { id: "localhost", name: "Example" } )
+				expect( options.attestation ).toBe( "none" )
+				expect( options.pubKeyCredParams.map( ( p ) => p.alg ) ).toBe( [ -8, -7 ] )
+				expect( options.user.id ).toBe( "NDI" )
+				expect( options.user.displayName ).toBe( "Alice A." )
+				expect( options.timeout ).toBe( 300000 )
+				expect( options.authenticatorSelection.residentKey ).toBe( "required" )
+				expect( options.excludeCredentials ).toBeEmpty()
+				expect( sessionData.passkeyChallenge.value ).toBe( options.challenge )
+			} )
+
+			it( "doesn't offer a device that already holds one of the user's passkeys", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				enrol( rp, key )
+				var options = rp.registrationOptions( { id: "1", name: "alice" }, {} )
+				expect( options.excludeCredentials ).toHaveLength( 1 )
+				expect( options.excludeCredentials[ 1 ].id ).toBe( key.getCredentialId() )
+				expect( options.excludeCredentials[ 1 ].transports ).toBe( [ "internal" ] )
+			} )
+
+			it( "stops at maxPerUser", () => {
+				var rp = party( { maxPerUser: 1 } )
+				enrol( rp, new FakeAuthenticator() )
+				expect( () => rp.registrationOptions( { id: "1", name: "alice" }, {} ) ).toThrow( "Passkeys.Invalid" )
+			} )
+
+			it( "keeps its challenge under the configured session key", () => {
+				var rp = party( { sessionKey: "webauthn" } )
+				var sessionData = {}
+				var options = rp.registrationOptions( { id: "1", name: "alice" }, sessionData )
+				expect( sessionData.webauthn.value ).toBe( options.challenge )
+				expect( sessionData ).notToHaveKey( "passkeyChallenge" )
+			} )
+
+			it( "refuses settings it can't honour", () => {
+				expect( () => party( { algorithms: [ -35 ] } ) ).toThrow( "Passkeys.Configuration" )
+				expect( () => party( { rpId: "" } ) ).toThrow( "Passkeys.Configuration" )
+				expect( () => party().registrationOptions( { id: "", name: "x" }, {} ) ).toThrow( "Passkeys.Configuration" )
+			} )
+
+		} )
+
+		describe( "Registering and signing in", () => {
+
+			for ( var algorithm in [ -7, -8, -257 ] ) {
+				it( "works for algorithm #algorithm# from the browser's SPKI key", ( data ) => {
+					var rp = party()
+					var key = new FakeAuthenticator( algorithm = data.algorithm )
+					var saved = enrol( rp, key, { id: "1", name: "alice" }, { attestationObject: javacast( "null", "" ) } )
+					expect( saved.algorithm ).toBe( data.algorithm )
+					expect( saved.userId ).toBe( "1" )
+					var sessionData = {}
+					var result = rp.verify( sessionData, key.get( rp.signInOptions( sessionData ) ) )
+					expect( result.userId ).toBe( "1" )
+					expect( result.credentialId ).toBe( key.getCredentialId() )
+					expect( result.userVerified ).toBeTrue()
+				}, [], false, { algorithm: algorithm } )
+
+				it( "works for algorithm #algorithm# from attestationObject alone", ( data ) => {
+					var rp = party()
+					var key = new FakeAuthenticator( algorithm = data.algorithm )
+					var saved = enrol( rp, key, { id: "1", name: "alice" }, { publicKey: javacast( "null", "" ), publicKeyAlgorithm: javacast( "null", "" ), authenticatorData: javacast( "null", "" ) } )
+					expect( saved.algorithm ).toBe( data.algorithm )
+					var sessionData = {}
+					expect( rp.verify( sessionData, key.get( rp.signInOptions( sessionData ) ) ).userId ).toBe( "1" )
+				}, [], false, { algorithm: algorithm } )
+			}
+
+			it( "gets the same key from SPKI and from the COSE key", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var fromSpki = enrol( rp, key, { id: "1", name: "alice" }, { attestationObject: javacast( "null", "" ) } )
+				var other = party()
+				var fromCose = enrol( other, key, { id: "1", name: "alice" }, { publicKey: javacast( "null", "" ) } )
+				expect( fromCose.publicKey ).toBe( fromSpki.publicKey )
+			} )
+
+			it( "keeps the sign count and the time of last use", () => {
+				var store = new bxModules.bxPasskeys.models.MemoryCredentialStore()
+				var rp = party( {}, store )
+				var key = new FakeAuthenticator()
+				enrol( rp, key )
+				expect( isNull( store.findByCredentialId( key.getCredentialId() ).lastUsedAt ) ).toBeTrue()
+				var sessionData = {}
+				rp.verify( sessionData, key.get( rp.signInOptions( sessionData ) ) )
+				var held = store.findByCredentialId( key.getCredentialId() )
+				expect( held.signCount ).toBe( 1 )
+				expect( isDate( held.lastUsedAt ) ).toBeTrue()
+			} )
+
+			it( "offers only that user's passkeys when confirming a signed-in user", () => {
+				var rp = party()
+				var mine = new FakeAuthenticator()
+				var theirs = new FakeAuthenticator()
+				enrol( rp, mine )
+				enrol( rp, theirs, { id: "2", name: "bob" } )
+				var sessionData = {}
+				var options = rp.signInOptions( sessionData, "1" )
+				expect( options.allowCredentials.map( ( c ) => c.id ) ).toBe( [ mine.getCredentialId() ] )
+				refused( rp, sessionData, theirs.get( options ), "another account" )
+				options = rp.signInOptions( sessionData, "1" )
+				expect( rp.verify( sessionData, mine.get( options ) ).userId ).toBe( "1" )
+			} )
+
+			it( "returns the passkey on file when the same one is registered twice", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				enrol( rp, key )
+				expect( enrol( rp, key ).credentialId ).toBe( key.getCredentialId() )
+				expect( () => enrol( rp, key, { id: "2", name: "bob" } ) ).toThrow( "Passkeys.Invalid", "already in use" )
+			} )
+
+		} )
+
+		describe( "Refusing registrations", () => {
+
+			it( "refuses an id that isn't the authenticator's, a key that won't read, or an algorithm not offered", () => {
+				var rp = party( { algorithms: [ -7 ] } )
+				var key = new FakeAuthenticator()
+				expect( () => enrol( rp, key, { id: "1", name: "alice" }, { id: "AAAAAAAAAAAAAAAAAAAAAA" } ) ).toThrow( "Passkeys.Invalid", "id doesn't match" )
+				expect( () => enrol( rp, key, { id: "1", name: "alice" }, { publicKey: "bm90IGEga2V5", attestationObject: javacast( "null", "" ) } ) ).toThrow( "Passkeys.Invalid" )
+				expect( () => enrol( rp, key, { id: "1", name: "alice" }, { publicKeyAlgorithm: -999, attestationObject: javacast( "null", "" ) } ) ).toThrow( "Passkeys.Invalid" )
+				var ed = new FakeAuthenticator( algorithm = -8 )
+				expect( () => enrol( rp, ed ) ).toThrow( "Passkeys.Invalid", "kind of key" )
+			} )
+
+			it( "refuses an SPKI key that isn't the one in authenticatorData", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var stranger = new FakeAuthenticator()
+				var swapped = stranger.create( { challenge: "x", user: { id: "MQ" } } ).publicKey
+				expect( () => enrol( rp, key, { id: "1", name: "alice" }, { publicKey: swapped } ) ).toThrow( "Passkeys.Invalid", "doesn't match" )
+			} )
+
+			it( "refuses an answer to another account's registration, or a sign-in challenge", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var sessionData = {}
+				var options = rp.registrationOptions( { id: "1", name: "alice" }, sessionData )
+				expect( () => rp.register( { id: "2", name: "bob" }, sessionData, key.create( options ) ) ).toThrow( "Passkeys.Invalid", "another account" )
+				options = rp.signInOptions( sessionData )
+				expect( () => rp.register( { id: "1", name: "alice" }, sessionData, key.create( options.append( { user: { id: "MQ" } } ) ) ) ).toThrow( "Passkeys.Invalid", "already used" )
+			} )
+
+			it( "refuses a registration for another site", () => {
+				var rp = party()
+				var key = new FakeAuthenticator( rpId = "evil.example" )
+				expect( () => enrol( rp, key ) ).toThrow( "Passkeys.Invalid", "another site" )
+			} )
+
+			it( "refuses an attestationObject that isn't CBOR", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				expect( () => enrol( rp, key, { id: "1", name: "alice" }, { attestationObject: "AAEC" } ) ).toThrow( "Passkeys.Invalid" )
+			} )
+
+		} )
+
+		describe( "Refusing sign-ins", () => {
+
+			beforeEach( () => {
+				variables.rp = party()
+				variables.key = new FakeAuthenticator()
+				enrol( variables.rp, variables.key )
+				variables.sessionData = {}
+			} )
+
+			it( "refuses a challenge the server never gave, and uses each one up", () => {
+				rp.signInOptions( sessionData )
+				refused( rp, sessionData, key.get( { challenge: "made-up" } ), "another try" )
+				var options = rp.signInOptions( sessionData )
+				try {
+					rp.verify( sessionData, key.get( { challenge: "made-up" } ) )
+				} catch ( "Passkeys.Invalid" e ) {
+				}
+				refused( rp, sessionData, key.get( options ), "already used" )
+			} )
+
+			it( "refuses an expired challenge", () => {
+				var options = rp.signInOptions( sessionData )
+				sessionData.passkeyChallenge.expires = now().getTime() - 1
+				refused( rp, sessionData, key.get( options ), "too long" )
+			} )
+
+			it( "refuses another origin, and plain http anywhere but localhost", () => {
+				var options = rp.signInOptions( sessionData )
+				refused( rp, sessionData, key.setOrigin( "https://evil.example" ).get( options ), "another site" )
+				options = rp.signInOptions( sessionData )
+				refused( rp, sessionData, key.setOrigin( "http://localhost.evil.example" ).get( options ), "another site" )
+				options = rp.signInOptions( sessionData )
+				expect( rp.verify( sessionData, key.setOrigin( "https://localhost:8443" ).get( options ) ).userId ).toBe( "1" )
+			} )
+
+			it( "refuses a registration answer offered as a sign-in", () => {
+				refused( rp, sessionData, key.get( rp.signInOptions( sessionData ), "webauthn.create" ), "something else" )
+			} )
+
+			it( "refuses a signature from a key that isn't the one on file", () => {
+				refused( rp, sessionData, key.get( rp.signInOptions( sessionData ), "webauthn.get", new FakeAuthenticator() ), "signature" )
+			} )
+
+			it( "refuses a passkey it doesn't know", () => {
+				refused( rp, sessionData, new FakeAuthenticator().get( rp.signInOptions( sessionData ) ), "isn't one this site knows" )
+			} )
+
+			it( "refuses an answer without user presence", () => {
+				refused( rp, sessionData, key.get( rp.signInOptions( sessionData ), "webauthn.get", key, 0 ), "you were there" )
+			} )
+
+			it( "refuses an unverified user when userVerification is required", () => {
+				var strict = party( { userVerification: "required" } )
+				var strictKey = new FakeAuthenticator()
+				enrol( strict, strictKey )
+				refused( strict, sessionData, strictKey.get( strict.signInOptions( sessionData ), "webauthn.get", strictKey, 1 ), "it was you" )
+				expect( strict.verify( sessionData, strictKey.get( strict.signInOptions( sessionData ) ) ).userVerified ).toBeTrue()
+			} )
+
+			it( "refuses a sign count that goes backwards", () => {
+				rp.verify( sessionData, key.setCounter( 9 ).get( rp.signInOptions( sessionData ) ) )
+				refused( rp, sessionData, key.setCounter( 3 ).get( rp.signInOptions( sessionData ) ), "copied" )
+			} )
+
+			it( "refuses a userHandle that isn't the passkey's user", () => {
+				var answer = key.get( rp.signInOptions( sessionData ) )
+				answer.userHandle = "Mg"
+				refused( rp, sessionData, answer, "another account" )
+			} )
+
+		} )
+
+		describe( "Origins", () => {
+
+			it( "allows https on the rpId and its subdomains, http only on localhost", () => {
+				var rp = party( { rpId: "example.com" } )
+				expect( rp.originAllowed( "https://example.com" ) ).toBeTrue()
+				expect( rp.originAllowed( "https://app.example.com:8443" ) ).toBeTrue()
+				expect( rp.originAllowed( "http://example.com" ) ).toBeFalse()
+				expect( rp.originAllowed( "https://example.com.evil.net" ) ).toBeFalse()
+				expect( rp.originAllowed( "https://notexample.com" ) ).toBeFalse()
+				expect( rp.originAllowed( "https://example.com/path" ) ).toBeFalse()
+			} )
+
+			it( "allows exactly the configured origins when given", () => {
+				var rp = party( { rpId: "example.com", origins: [ "https://example.com", "https://login.example.com/" ] } )
+				expect( rp.originAllowed( "https://example.com" ) ).toBeTrue()
+				expect( rp.originAllowed( "https://login.example.com" ) ).toBeTrue()
+				expect( rp.originAllowed( "https://app.example.com" ) ).toBeFalse()
+			} )
+
+		} )
+
+	}
+
+}

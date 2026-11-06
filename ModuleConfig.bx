@@ -1,0 +1,36 @@
+/**
+ * bx-passkeys: WebAuthn passkeys for BoxLang, JDK crypto only.
+ * Settings go in boxlang.json under modules.bxPasskeys.settings, or straight
+ * to passkeyRelyingParty() / new RelyingParty().
+ */
+class {
+
+	this.version     = "0.1.0";
+	this.mapping     = "bxPasskeys";
+	this.author      = "Robert Zehnder";
+	this.description = "WebAuthn passkeys (registration and sign-in) for BoxLang with JDK crypto only.";
+	this.webURL      = "https://github.com/robertz/bx-passkeys";
+	this.enabled     = true;
+
+	function configure() {
+		settings = {
+			rpId             : "localhost",
+			rpName           : "",
+			origins          : [],
+			challengeSeconds : 300,
+			algorithms       : [ -7, -8, -257 ],
+			userVerification : "preferred",
+			residentKey      : "required",
+			maxPerUser       : 0,
+			sessionKey       : "passkeyChallenge",
+			store            : { table: "passkey_credentials", datasource: "" }
+		};
+	}
+
+	function onLoad() {
+	}
+
+	function onUnload() {
+	}
+
+}

@@ -1,0 +1,17 @@
+/**
+ * A RelyingParty from the module's settings, with `overrides` on top.
+ * Without a `store` it uses a TableCredentialStore built from settings.store.
+ *
+ *   rp = passkeyRelyingParty( { rpId: "example.com", rpName: "Example" } )
+ *   rp = passkeyRelyingParty( store = new MyStore() )
+ */
+@BoxBIF
+class {
+
+	function invoke( struct overrides = {}, store ) {
+		var settings = duplicate( getModuleInfo( "bxPasskeys" ).settings ).append( arguments.overrides )
+		var credentials = arguments.store ?: new bxModules.bxPasskeys.models.TableCredentialStore( settings.store ?: {} )
+		return new bxModules.bxPasskeys.models.RelyingParty( settings, credentials )
+	}
+
+}

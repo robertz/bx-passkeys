@@ -1,0 +1,32 @@
+/** The module as installed: its settings and the passkeyRelyingParty() BIF. */
+class extends="testbox.system.BaseSpec" {
+
+	function run() {
+
+		describe( "bxPasskeys module", () => {
+
+			it( "registers its settings", () => {
+				var settings = getModuleInfo( "bxPasskeys" ).settings
+				expect( settings.challengeSeconds ).toBe( 300 )
+				expect( settings.algorithms ).toBe( [ -7, -8, -257 ] )
+				expect( settings.store.table ).toBe( "passkey_credentials" )
+			} )
+
+			it( "builds a RelyingParty from the settings with overrides and a store", () => {
+				var store = new bxModules.bxPasskeys.models.MemoryCredentialStore()
+				var rp = passkeyRelyingParty( { rpId: "Example.com", challengeSeconds: 60 }, store )
+				expect( rp.getSettings().rpId ).toBe( "example.com" )
+				expect( rp.getSettings().rpName ).toBe( "example.com" )
+				expect( rp.getSettings().challengeSeconds ).toBe( 60 )
+				expect( rp.getStore() ).toBe( store )
+			} )
+
+			it( "defaults to the table store", () => {
+				expect( getMetadata( passkeyRelyingParty().getStore() ).name ).toInclude( "TableCredentialStore" )
+			} )
+
+		} )
+
+	}
+
+}
