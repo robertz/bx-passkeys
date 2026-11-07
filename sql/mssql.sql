@@ -1,6 +1,6 @@
 CREATE TABLE passkey_credentials (
-	credential_id VARCHAR(1400) NOT NULL PRIMARY KEY NONCLUSTERED,
-	user_id       VARCHAR(255)  NOT NULL,
+	credential_id VARCHAR(1400) COLLATE Latin1_General_100_BIN2 NOT NULL PRIMARY KEY NONCLUSTERED,
+	user_id       VARCHAR(255)  COLLATE Latin1_General_100_BIN2 NOT NULL,
 	public_key    VARCHAR(2048) NOT NULL,
 	algorithm     INT           NOT NULL,
 	sign_count    BIGINT        NOT NULL DEFAULT 0,

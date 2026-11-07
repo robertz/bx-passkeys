@@ -5,7 +5,7 @@
  */
 class {
 
-	this.version     = "0.1.0";
+	this.version     = "0.2.0";
 	this.mapping     = "bxPasskeys";
 	this.author      = "Robert Zehnder";
 	this.description = "WebAuthn passkeys (registration and sign-in) for BoxLang with JDK crypto only.";
@@ -13,17 +13,9 @@ class {
 	this.enabled     = true;
 
 	function configure() {
+		// every other setting defaults in RelyingParty's DEFAULTS
 		settings = {
-			rpId             : "localhost",
-			rpName           : "",
-			origins          : [],
-			challengeSeconds : 300,
-			algorithms       : [ -7, -8, -257 ],
-			userVerification : "preferred",
-			residentKey      : "required",
-			maxPerUser       : 0,
-			sessionKey       : "passkeyChallenge",
-			store            : { table: "passkey_credentials", datasource: "" }
+			store : { table: "passkey_credentials", datasource: "" }
 		};
 	}
 

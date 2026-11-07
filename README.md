@@ -49,13 +49,14 @@ Or pass them straight in: `passkeyRelyingParty( { rpId: "example.com" } )`.
 |---|---|---|
 | `rpId` | `"localhost"` | Your site's domain. Passkeys are bound to it, so they also work on its subdomains. |
 | `rpName` | the rpId | The name shown in the browser's passkey sheet. |
-| `origins` | `[]` | The exact origins sign-ins may come from, e.g. `[ "https://example.com" ]`. When it's empty, the module allows `https` on the rpId or any of its subdomains, and plain `http` only on `localhost`. |
+| `origins` | `[]` | The exact origins sign-ins may come from, e.g. `[ "https://example.com" ]`. When it's empty, the module allows `https` on the rpId itself (any port), and plain `http` only on `localhost`. |
+| `allowSubdomains` | `false` | With `origins` empty, also allow `https` on any subdomain of the rpId. Leave it off if anyone else can serve pages on a subdomain (user content, previews): such a page could relay sign-ins. |
 | `challengeSeconds` | `300` | How long a challenge stays good. This is also the browser's timeout. |
 | `algorithms` | `[ -7, -8, -257 ]` | COSE algorithm ids to accept, in order of preference. |
 | `userVerification` | `"preferred"` | Set it to `"required"` to refuse an authenticator that didn't check a PIN or biometric. |
 | `residentKey` | `"required"` | Discoverable credentials, so people can sign in without typing a username. |
 | `maxPerUser` | `0` | The most passkeys one user may have. `0` means no limit. |
-| `sessionKey` | `"passkeyChallenge"` | The key in your session struct where the pending challenge is kept. |
+| `sessionKey` | `"passkeyChallenge"` | The key in your session struct where pending challenges are kept, one for registration and one for sign-in. |
 | `store` | `{ table, datasource }` | Settings for the default `TableCredentialStore`. |
 
 ## Usage
@@ -136,13 +137,15 @@ A store implements `bxModules.bxPasskeys.models.CredentialStore`:
 function findByCredentialId( required string credentialId )   // struct or null
 array function listForUser( required string userId )          // newest first
 void function add( required struct credential )
-void function updateUsage( required string credentialId, required numeric signCount, required date lastUsedAt )
+boolean function updateUsage( required string credentialId, required numeric signCount, required date lastUsedAt )
 boolean function remove( required string credentialId )
 ```
 
-A credential is `{ credentialId, userId, publicKey, algorithm, signCount, transports, name, createdAt, lastUsedAt }`. `credentialId` and `publicKey` (SPKI) are base64url strings.
+A credential is `{ credentialId, userId, publicKey, algorithm, signCount, transports, name, createdAt, lastUsedAt }`. `credentialId` and `publicKey` (SPKI) are base64url strings. Compare `credentialId` and `userId` case-sensitively.
 
-- **`TableCredentialStore( { datasource, table } )`** uses one table with plain parameterized SQL. Create the table from `sql/mssql.sql`, `sql/mysql.sql` or `sql/postgres.sql`.
+`updateUsage` must check and write in one step: save only while the new `signCount` is above the stored one (or both are 0), and return whether it saved. That's what keeps two sign-ins racing with the same counter from both getting through.
+
+- **`TableCredentialStore( { datasource, table } )`** uses one table with plain parameterized SQL. Create the table from `sql/mssql.sql`, `sql/mysql.sql` or `sql/postgres.sql`. The scripts give `credential_id` and `user_id` binary collations, so they compare case-sensitively; keep that if you write your own.
 - **`MemoryCredentialStore()`** holds passkeys in memory, for tests and demos.
 
 To list or remove a user's passkeys in your account settings, call the store directly: `rp.getStore().listForUser( user.id )`.
@@ -151,19 +154,21 @@ To list or remove a user's passkeys in your account settings, call the store dir
 
 On **registration**:
 
-- The challenge is the one in the session, for registration, still in date, and for the same user.
+- The challenge is the one in the session, for registration, still in date, and for the same user. Taking it is locked per session, so one challenge can't be used twice at once.
 - `clientDataJSON` has type `webauthn.create`, an allowed origin, and isn't from a cross-origin frame.
 - `authenticatorData` carries the SHA-256 of the rpId, the user-present flag (and the user-verified flag when that's required), and attested credential data.
-- The credential id matches the one in `authenticatorData`.
-- The key is one of the accepted algorithms and can be read. When both SPKI and a COSE key are sent, they must match.
+- The credential id matches the one in `authenticatorData` and is at most 1023 bytes. It's stored in canonical base64url, whatever padding the browser sent.
+- `authenticatorData` carries the COSE key, which is one of the accepted algorithms and can be read. When the browser also sends an SPKI key, it must be the same key.
+- The user is still under `maxPerUser`.
 - The passkey isn't already registered to another user.
 
 On **sign-in**, the same challenge, origin, rpId and flag checks apply, plus:
 
 - The credential is on file.
 - It belongs to the expected user, if one was given, and matches `userHandle`, if the browser sent one.
+- Its algorithm is still one of the accepted `algorithms`.
 - The signature over `authenticatorData ‖ SHA-256(clientDataJSON)` verifies.
-- The signature counter doesn't go backwards. A counter that goes backwards suggests a cloned key; most passkeys always send 0.
+- The signature counter moves forward, unless it's 0 and always has been (most passkeys always send 0). A counter that stays put, goes backwards or drops to 0 suggests a cloned key. The store saves the new counter only if it's still ahead, so two sign-ins racing with one counter can't both succeed.
 
 Every refusal throws `Passkeys.Invalid` with a message you can show the user. A bad setting throws `Passkeys.Configuration`.
 

@@ -1,0 +1,34 @@
+/** Wraps a CredentialStore and reports every credential's counter as 0, to stand in for a read that lost a race. */
+class implements="bxModules.bxPasskeys.models.CredentialStore" {
+
+	function init( required inner ) {
+		variables.inner = arguments.inner
+		return this
+	}
+
+	function findByCredentialId( required string credentialId ) {
+		var found = variables.inner.findByCredentialId( arguments.credentialId )
+		if ( isNull( found ) ) {
+			return javacast( "null", "" )
+		}
+		found.signCount = 0
+		return found
+	}
+
+	array function listForUser( required string userId ) {
+		return variables.inner.listForUser( arguments.userId )
+	}
+
+	void function add( required struct credential ) {
+		variables.inner.add( arguments.credential )
+	}
+
+	boolean function updateUsage( required string credentialId, required numeric signCount, required date lastUsedAt ) {
+		return variables.inner.updateUsage( arguments.credentialId, arguments.signCount, arguments.lastUsedAt )
+	}
+
+	boolean function remove( required string credentialId ) {
+		return variables.inner.remove( arguments.credentialId )
+	}
+
+}

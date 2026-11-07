@@ -40,7 +40,7 @@ class extends="testbox.system.BaseSpec" {
 				expect( options.timeout ).toBe( 300000 )
 				expect( options.authenticatorSelection.residentKey ).toBe( "required" )
 				expect( options.excludeCredentials ).toBeEmpty()
-				expect( sessionData.passkeyChallenge.value ).toBe( options.challenge )
+				expect( sessionData.passkeyChallenge.register.value ).toBe( options.challenge )
 			} )
 
 			it( "doesn't offer a device that already holds one of the user's passkeys", () => {
@@ -63,7 +63,7 @@ class extends="testbox.system.BaseSpec" {
 				var rp = party( { sessionKey: "webauthn" } )
 				var sessionData = {}
 				var options = rp.registrationOptions( { id: "1", name: "alice" }, sessionData )
-				expect( sessionData.webauthn.value ).toBe( options.challenge )
+				expect( sessionData.webauthn.register.value ).toBe( options.challenge )
 				expect( sessionData ).notToHaveKey( "passkeyChallenge" )
 			} )
 
@@ -137,6 +137,36 @@ class extends="testbox.system.BaseSpec" {
 				expect( rp.verify( sessionData, mine.get( options ) ).userId ).toBe( "1" )
 			} )
 
+			it( "keeps a registration challenge while a sign-in is started in the same session", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var sessionData = {}
+				var creation = rp.registrationOptions( { id: "1", name: "alice" }, sessionData )
+				rp.signInOptions( sessionData )
+				var saved = rp.register( { id: "1", name: "alice" }, sessionData, key.create( creation ) )
+				expect( saved.credentialId ).toBe( key.getCredentialId() )
+			} )
+
+			it( "stores the canonical credential id, whatever padding the browser sent", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var saved = enrol( rp, key, { id: "1", name: "alice" }, { id: key.getCredentialId() & "==" } )
+				expect( saved.credentialId ).toBe( key.getCredentialId() )
+				var sessionData = {}
+				var answer = key.get( rp.signInOptions( sessionData ) )
+				answer.id &= "=="
+				expect( rp.verify( sessionData, answer ).credentialId ).toBe( key.getCredentialId() )
+			} )
+
+			it( "refuses a sign-in with an algorithm no longer accepted", () => {
+				var store = new bxModules.bxPasskeys.models.MemoryCredentialStore()
+				var key = new FakeAuthenticator( algorithm = -257 )
+				enrol( party( {}, store ), key )
+				var strict = party( { algorithms: [ -7 ] }, store )
+				var sessionData = {}
+				refused( strict, sessionData, key.get( strict.signInOptions( sessionData ) ), "kind of key" )
+			} )
+
 			it( "returns the passkey on file when the same one is registered twice", () => {
 				var rp = party()
 				var key = new FakeAuthenticator()
@@ -183,6 +213,41 @@ class extends="testbox.system.BaseSpec" {
 				expect( () => enrol( rp, key ) ).toThrow( "Passkeys.Invalid", "another site" )
 			} )
 
+			it( "refuses authenticatorData whose attested credential data has no key", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var sessionData = {}
+				var options = rp.registrationOptions( { id: "1", name: "alice" }, sessionData )
+				var answer = key.create( options, { attestationObject: javacast( "null", "" ) } )
+				var data = createObject( "java", "java.util.Base64" ).getUrlDecoder().decode( answer.authenticatorData )
+				var idLength = len( createObject( "java", "java.util.Base64" ).getUrlDecoder().decode( answer.id ) )
+				var trimmed = createObject( "java", "java.util.Arrays" ).copyOfRange( data, 0, javacast( "int", 55 + idLength ) )
+				answer.authenticatorData = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding().encodeToString( trimmed )
+				expect( () => rp.register( { id: "1", name: "alice" }, sessionData, answer ) ).toThrow( "Passkeys.Invalid", "without its key" )
+			} )
+
+			it( "refuses a credential id over 1023 bytes", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var long = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding().encodeToString( createObject( "java", "java.nio.ByteBuffer" ).allocate( 1024 ).array() )
+				expect( () => enrol( rp, key, { id: "1", name: "alice" }, { id: long } ) ).toThrow( "Passkeys.Invalid", "too long" )
+			} )
+
+			it( "keeps at most a few distinct, well-formed transports", () => {
+				var rp = party()
+				var key = new FakeAuthenticator()
+				var saved = enrol( rp, key, { id: "1", name: "alice" }, { transports: [ "usb", "usb", "nfc", "Bad,One", "a", "b", "c", "d", "e", "f", "g", "h", "i" ] } )
+				expect( saved.transports ).toBe( [ "usb", "nfc", "a", "b", "c", "d", "e", "f", "g", "h" ] )
+			} )
+
+			it( "enforces maxPerUser at registration too", () => {
+				var rp = party( { maxPerUser: 1 } )
+				var sessionData = {}
+				var options = rp.registrationOptions( { id: "1", name: "alice" }, sessionData )
+				enrol( rp, new FakeAuthenticator() )
+				expect( () => rp.register( { id: "1", name: "alice" }, sessionData, new FakeAuthenticator().create( options ) ) ).toThrow( "Passkeys.Invalid", "as many passkeys" )
+			} )
+
 			it( "refuses an attestationObject that isn't CBOR", () => {
 				var rp = party()
 				var key = new FakeAuthenticator()
@@ -213,7 +278,7 @@ class extends="testbox.system.BaseSpec" {
 
 			it( "refuses an expired challenge", () => {
 				var options = rp.signInOptions( sessionData )
-				sessionData.passkeyChallenge.expires = now().getTime() - 1
+				sessionData.passkeyChallenge[ "sign-in" ].expires = now().getTime() - 1
 				refused( rp, sessionData, key.get( options ), "too long" )
 			} )
 
@@ -255,6 +320,23 @@ class extends="testbox.system.BaseSpec" {
 				refused( rp, sessionData, key.setCounter( 3 ).get( rp.signInOptions( sessionData ) ), "copied" )
 			} )
 
+			it( "refuses a counter that drops back to 0, and keeps the stored one", () => {
+				rp.verify( sessionData, key.setCounter( 41 ).get( rp.signInOptions( sessionData ) ) )
+				refused( rp, sessionData, key.setCounter( -1 ).get( rp.signInOptions( sessionData ) ), "copied" )
+				expect( rp.getStore().findByCredentialId( key.getCredentialId() ).signCount ).toBe( 42 )
+			} )
+
+			it( "refuses a sign-in the store says lost the race to a newer counter", () => {
+				var store = new bxModules.bxPasskeys.models.MemoryCredentialStore()
+				var racer = new FakeAuthenticator()
+				enrol( party( {}, store ), racer )
+				store.updateUsage( racer.getCredentialId(), 7, now() )
+				// reads as counter 0, as a request that loaded the row before the other one saved 7 would
+				var stale = party( {}, new tests.helpers.StaleStore( store ) )
+				refused( stale, sessionData, racer.setCounter( 4 ).get( stale.signInOptions( sessionData ) ), "copied" )
+				expect( store.findByCredentialId( racer.getCredentialId() ).signCount ).toBe( 7 )
+			} )
+
 			it( "refuses a userHandle that isn't the passkey's user", () => {
 				var answer = key.get( rp.signInOptions( sessionData ) )
 				answer.userHandle = "Mg"
@@ -265,14 +347,22 @@ class extends="testbox.system.BaseSpec" {
 
 		describe( "Origins", () => {
 
-			it( "allows https on the rpId and its subdomains, http only on localhost", () => {
+			it( "allows https on the rpId only, http only on localhost", () => {
 				var rp = party( { rpId: "example.com" } )
 				expect( rp.originAllowed( "https://example.com" ) ).toBeTrue()
-				expect( rp.originAllowed( "https://app.example.com:8443" ) ).toBeTrue()
+				expect( rp.originAllowed( "https://example.com:8443" ) ).toBeTrue()
+				expect( rp.originAllowed( "https://app.example.com" ) ).toBeFalse()
 				expect( rp.originAllowed( "http://example.com" ) ).toBeFalse()
 				expect( rp.originAllowed( "https://example.com.evil.net" ) ).toBeFalse()
 				expect( rp.originAllowed( "https://notexample.com" ) ).toBeFalse()
 				expect( rp.originAllowed( "https://example.com/path" ) ).toBeFalse()
+			} )
+
+			it( "allows subdomains when allowSubdomains is on", () => {
+				var rp = party( { rpId: "example.com", allowSubdomains: true } )
+				expect( rp.originAllowed( "https://app.example.com:8443" ) ).toBeTrue()
+				expect( rp.originAllowed( "https://example.com.evil.net" ) ).toBeFalse()
+				expect( rp.originAllowed( "http://app.example.com" ) ).toBeFalse()
 			} )
 
 			it( "allows exactly the configured origins when given", () => {

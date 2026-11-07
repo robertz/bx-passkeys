@@ -7,9 +7,11 @@ class extends="testbox.system.BaseSpec" {
 
 			it( "registers its settings", () => {
 				var settings = getModuleInfo( "bxPasskeys" ).settings
-				expect( settings.challengeSeconds ).toBe( 300 )
-				expect( settings.algorithms ).toBe( [ -7, -8, -257 ] )
 				expect( settings.store.table ).toBe( "passkey_credentials" )
+				var defaults = passkeyRelyingParty( {}, new bxModules.bxPasskeys.models.MemoryCredentialStore() ).getSettings()
+				expect( defaults.challengeSeconds ).toBe( 300 )
+				expect( defaults.algorithms ).toBe( [ "-7", "-8", "-257" ] )
+				expect( defaults.allowSubdomains ).toBeFalse()
 			} )
 
 			it( "builds a RelyingParty from the settings with overrides and a store", () => {
