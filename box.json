@@ -45,6 +45,7 @@
         "boxlang_modules/**",
         "run-tests.bxs",
         "setup-tests.bxs",
-        "scripts/**"
+        "scripts/**",
+        "docs/**"
     ]
 }
