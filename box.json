@@ -1,6 +1,6 @@
 {
     "name":"BxPasskeys",
-    "version":"0.2.0",
+    "version":"0.3.0",
     "author":"Robert Zehnder",
     "slug":"bx-passkeys",
     "shortDescription":"WebAuthn passkeys for BoxLang: registration and sign-in verified by webauthn4j, attestation none.",
