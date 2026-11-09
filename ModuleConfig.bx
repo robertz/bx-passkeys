@@ -5,7 +5,7 @@
  */
 class {
 
-	this.version     = "0.3.0";
+	this.version     = "0.3.1";
 	this.mapping     = "bxPasskeys";
 	this.author      = "Robert Zehnder";
 	this.description = "WebAuthn passkeys (registration and sign-in) for BoxLang, verified by webauthn4j.";

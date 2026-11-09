@@ -30,11 +30,13 @@
     ],
     "devDependencies":{
         "testbox":"^7.0.0",
-        "bx-derby":"^1.1.0"
+        "bx-derby":"^1.1.0",
+        "bx-compat-cfml":"^1.36.0"
     },
     "installPaths":{
         "testbox":"testbox/",
-        "bx-derby":"boxlang_modules/bx-derby/"
+        "bx-derby":"boxlang_modules/bx-derby/",
+        "bx-compat-cfml":"test-modules/bx-compat-cfml/"
     },
     "scripts":{
         "preVersion":"!bash scripts/test.sh",
@@ -45,6 +47,7 @@
         "tests/**",
         "testbox/**",
         "boxlang_modules/**",
+        "test-modules/**",
         "run-tests.bxs",
         "setup-tests.bxs",
         "scripts/**",

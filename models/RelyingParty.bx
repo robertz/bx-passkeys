@@ -244,10 +244,10 @@ class {
 		if ( len( held.userId ) && compare( held.userId, userId ) != 0 ) {
 			invalid( "That passkey belongs to another account" )
 		}
-		var userHandle = javacast( "null", "" )
-		if ( len( arguments.answer.userHandle ?: "" ) ) {
-			userHandle = decodeField( arguments.answer, "userHandle" )
-			if ( compare( createObject( "java", "java.lang.String" ).init( userHandle, "UTF-8" ), userId ) != 0 ) {
+		var hasHandle = len( arguments.answer.userHandle ?: "" ) > 0
+		if ( hasHandle ) {
+			var handle = createObject( "java", "java.lang.String" ).init( decodeField( arguments.answer, "userHandle" ), "UTF-8" )
+			if ( compare( handle, userId ) != 0 ) {
 				invalid( "That passkey belongs to another account" )
 			}
 		}
@@ -257,7 +257,7 @@ class {
 		}
 		var signIn = createObject( "java", "com.webauthn4j.data.AuthenticationRequest" ).init(
 			idBytes,
-			userHandle,
+			hasHandle ? decodeField( arguments.answer, "userHandle" ) : javacast( "null", "" ),
 			decodeField( arguments.answer, "authenticatorData" ),
 			decodeField( arguments.answer, "clientDataJSON" ),
 			decodeField( arguments.answer, "signature" )

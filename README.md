@@ -200,11 +200,11 @@ webauthn4j logs through SLF4J, which BoxLang already provides. To update, change
 ## Development
 
 ```bash
-box install                 # TestBox and bx-derby
-bash scripts/test.sh        # sets up .tmp/bxhome on first run, then runs the specs
+box install                 # TestBox, bx-derby and bx-compat-cfml
+bash scripts/test.sh        # sets up the test homes on first run, then runs the specs in each
 ```
 
-The specs run in a BoxLang home of their own (`.tmp/bxhome`), whose only modules are this checkout and bx-derby, so a bx-passkeys installed in `~/.boxlang/modules` can't stand in for the code under test. The table-store spec uses an in-memory Derby database.
+The specs run in two BoxLang homes of their own: `.tmp/bxhome` (this checkout and bx-derby) and `.tmp/bxhome-compat` (the same plus bx-compat-cfml, which changes how nulls behave). A bx-passkeys installed in `~/.boxlang/modules` can't stand in for the code under test. The table-store spec uses an in-memory Derby database.
 
 ## License
 

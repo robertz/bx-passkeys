@@ -1,5 +1,11 @@
 # Changelog
 
+**0.3.1**
+- A sign-in without `userHandle` (a non-discoverable passkey) failed with
+  "The requested key [userHandle] was not located" in apps that load
+  bx-compat-cfml. Fixed.
+- The specs run twice, plain and with bx-compat-cfml loaded.
+
 **0.3.0**
 - Browser answers are now verified by webauthn4j 0.32 (shipped in `libs/` with
   Jackson 3) instead of the module's own CBOR, COSE and signature code, which is

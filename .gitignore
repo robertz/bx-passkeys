@@ -1,5 +1,6 @@
 # CommandBox / BoxLang dependencies
 boxlang_modules/
+test-modules/
 testbox/
 .tmp/
 .artifacts/

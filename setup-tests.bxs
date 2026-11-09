@@ -1,22 +1,30 @@
 /**
- * Once per checkout: makes .tmp/bxhome, a BoxLang home of its own for the specs,
- * whose modules are this folder (as bxPasskeys) and bx-derby. A home of its own
- * so a bx-passkeys installed in ~/.boxlang/modules can't stand in for this checkout.
+ * Once per checkout: makes two BoxLang homes for the specs, .tmp/bxhome (this
+ * folder as bxPasskeys, plus bx-derby) and .tmp/bxhome-compat (the same with
+ * bx-compat-cfml, which many apps load and which changes how BoxLang treats nulls).
+ * Homes of their own so a bx-passkeys installed in ~/.boxlang/modules can't stand
+ * in for this checkout.
  *
- *   boxlang setup-tests.bxs
+ *   box install
  *   bash scripts/test.sh
  */
 paths = createObject( "java", "java.nio.file.Paths" )
 files = createObject( "java", "java.nio.file.Files" )
-modules = paths.get( expandPath( ".tmp/bxhome/modules" ) )
-files.createDirectories( modules )
-linkPath = modules.resolve( "bx-passkeys" )
-if ( !files.exists( linkPath, [] ) ) {
-	files.createSymbolicLink( linkPath, paths.get( "../../.." ) )
+for ( required in [ "boxlang_modules/bx-derby", "test-modules/bx-compat-cfml" ] ) {
+	if ( !files.exists( paths.get( expandPath( required ) ), [] ) ) {
+		println( "#required# is missing: run `box install` first, then this again." )
+		createObject( "java", "java.lang.System" ).exit( 1 )
+	}
 }
-derby = paths.get( expandPath( "boxlang_modules/bx-derby" ) )
-if ( !files.exists( derby, [] ) ) {
-	println( "bx-derby is missing: run `box install` first, then this again." )
-	createObject( "java", "java.lang.System" ).exit( 1 )
+function link( required string home, required string name, required string target ) {
+	var modules = paths.get( expandPath( ".tmp/#home#/modules" ) )
+	files.createDirectories( modules )
+	var linkPath = modules.resolve( name )
+	if ( !files.exists( linkPath, [] ) ) {
+		files.createSymbolicLink( linkPath, paths.get( target ) )
+	}
 }
-println( "Test home ready in .tmp/bxhome. Run `bash scripts/test.sh` now." )
+link( "bxhome", "bx-passkeys", "../../.." )
+link( "bxhome-compat", "bx-passkeys", "../../.." )
+link( "bxhome-compat", "bx-compat-cfml", "../../../test-modules/bx-compat-cfml" )
+println( "Test homes ready in .tmp. Run `bash scripts/test.sh` now." )

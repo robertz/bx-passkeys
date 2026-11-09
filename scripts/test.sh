@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Runs the specs in the test home that setup-tests.bxs makes; non-zero on any failure.
+# Runs the specs in both test homes setup-tests.bxs makes (plain, and with
+# bx-compat-cfml); non-zero on any failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if [[ ! -e .tmp/bxhome/modules/bx-passkeys ]]; then
+if [[ ! -e .tmp/bxhome-compat/modules/bx-compat-cfml ]]; then
   boxlang setup-tests.bxs
 fi
-exec boxlang --bx-home .tmp/bxhome run-tests.bxs
+for home in bxhome bxhome-compat; do
+  echo "== specs in .tmp/$home"
+  boxlang --bx-home ".tmp/$home" run-tests.bxs
+done
