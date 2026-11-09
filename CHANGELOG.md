@@ -1,5 +1,22 @@
 # Changelog
 
+**0.3.0**
+- Browser answers are now verified by webauthn4j 0.32 (shipped in `libs/` with
+  Jackson 3) instead of the module's own CBOR, COSE and signature code, which is
+  gone. Attestation statements of every format are checked for consistency.
+- **Breaking:** registration needs `attestationObject`. Every browser sends it,
+  and `client/passkeys.js` always did; answers with only `authenticatorData` and
+  the SPKI `publicKey` are refused.
+- `register()` and `verify()` report `backupEligible` and `backedUp`.
+- Answers from a cross-origin frame are refused at registration too, and
+  an answer that says it's backed up but not backup eligible is refused.
+- `userVerification`, `residentKey` and `origins` settings are validated when the
+  RelyingParty is built.
+- The specs run in a BoxLang home of their own (`bash scripts/test.sh`), so an
+  installed copy of the module can't stand in for the checkout.
+- The credential table and the `CredentialStore` interface are unchanged;
+  passkeys registered with 0.2 keep working.
+
 **0.2.0**
 - **Breaking:** with `origins` empty, only `https://<rpId>` is allowed now, not
   its subdomains. Set the new `allowSubdomains: true` (or list `origins`) to

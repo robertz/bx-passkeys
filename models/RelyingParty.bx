@@ -1,12 +1,14 @@
 /**
- * The server half of WebAuthn passkeys, with attestation "none" and JDK crypto only.
+ * The server half of WebAuthn passkeys. Options are built here; every answer is
+ * checked by webauthn4j (com.webauthn4j:webauthn4j-core, in libs/): client data,
+ * origin, rpId hash, flags, attestation statement, algorithm and signature.
+ * Attestation is "none": statements are checked for consistency, never against
+ * a trust root.
  *
- * Registration takes the new key either as SPKI (the browser's
- * AuthenticatorAttestationResponse.getPublicKey()) or from the COSE key inside
- * attestationObject. A sign-in is the authenticator's signature over
- * authenticatorData + SHA-256(clientDataJSON), checked with java.security.Signature.
- * Each challenge lives in a session struct the caller passes in, one per purpose
- * (registration, sign-in), and is good for one try within challengeSeconds.
+ * This class keeps what webauthn4j leaves to the caller: one-time challenges in
+ * a session struct the caller passes in, one per purpose (registration, sign-in),
+ * each good for one try within challengeSeconds; which user a passkey belongs to;
+ * and a sign counter saved only while it moves forward.
  */
 class {
 
@@ -14,15 +16,37 @@ class {
 	property name="store";
 
 	static {
-		SUPPORTED = { "-7": { key: "EC", signature: "SHA256withECDSA" }, "-8": { key: "Ed25519", signature: "Ed25519" }, "-257": { key: "RSA", signature: "SHA256withRSA" } }
-		FLAG_USER_PRESENT = 1
-		FLAG_USER_VERIFIED = 4
-		FLAG_ATTESTED = 64
 		MAX_CREDENTIAL_ID_BYTES = 1023
+		MAX_FIELD_LENGTH = 16000
 		MAX_TRANSPORTS = 10
 		RANDOM = createObject( "java", "java.security.SecureRandom" ).init()
 		URL_ENCODER = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding()
 		URL_DECODER = createObject( "java", "java.util.Base64" ).getUrlDecoder()
+		// thread-safe; non-strict verifies attestation statements without needing trust anchors
+		MANAGER = createObject( "java", "com.webauthn4j.WebAuthnManager" ).createNonStrictWebAuthnManager()
+		// webauthn4j exception class -> what a person is told
+		REASONS = {
+			BadChallengeException               : "That answer is for another try. Try again.",
+			MissingChallengeException           : "That answer is for another try. Try again.",
+			BadOriginException                  : "That passkey was used on another site",
+			BadTopOriginException               : "That passkey was used inside another site's frame",
+			CrossOriginException                : "That passkey was used inside another site's frame",
+			BadRpIdException                    : "That passkey is for another site",
+			InconsistentClientDataTypeException : "The browser's answer is for something else",
+			UserNotPresentException             : "The authenticator didn't confirm you were there",
+			UserNotVerifiedException            : "The authenticator didn't confirm it was you",
+			BadSignatureException               : "That passkey's signature doesn't check out",
+			BadAttestationStatementException    : "The authenticator's answer doesn't add up",
+			BadClientDataHashException          : "The authenticator's answer doesn't add up",
+			PublicKeyMismatchException          : "That passkey's key doesn't match the authenticator's",
+			NotAllowedAlgorithmException        : "That passkey uses a kind of key this site doesn't take",
+			BadAlgorithmException               : "That passkey uses a kind of key this site doesn't take",
+			MaliciousCounterValueException      : "That passkey looks copied. Remove it and add it again.",
+			IllegalBackupStateException         : "The authenticator's answer doesn't add up",
+			CredentialIdTooLongException        : "That passkey's id is too long",
+			ConstraintViolationException        : "The authenticator's answer can't be read",
+			DataConversionException             : "The authenticator's answer can't be read"
+		}
 		DEFAULTS = {
 			rpId             : "localhost",
 			rpName           : "",
@@ -54,14 +78,31 @@ class {
 			variables.settings.origins = listToArray( variables.settings.origins )
 		}
 		variables.settings.origins = variables.settings.origins.map( ( o ) => lcase( reReplace( trim( o ), "/+$", "" ) ) )
-		variables.settings.algorithms = variables.settings.algorithms.map( ( a ) => toString( int( a ) ) )
+		variables.settings.algorithms = variables.settings.algorithms.map( ( a ) => int( a ) )
 		for ( var alg in variables.settings.algorithms ) {
-			if ( !static.SUPPORTED.keyExists( alg ) ) {
+			if ( !static.DEFAULTS.algorithms.contains( alg ) ) {
 				throw( type = "Passkeys.Configuration", message = "Algorithm #alg# isn't supported; use -7, -8 or -257" )
 			}
 		}
-		variables.cbor = new Cbor()
-		variables.cose = new CoseKey()
+		if ( ![ "required", "preferred", "discouraged" ].contains( variables.settings.userVerification ) ) {
+			throw( type = "Passkeys.Configuration", message = "userVerification must be required, preferred or discouraged" )
+		}
+		if ( ![ "required", "preferred", "discouraged" ].contains( variables.settings.residentKey ) ) {
+			throw( type = "Passkeys.Configuration", message = "residentKey must be required, preferred or discouraged" )
+		}
+		var parameters = createObject( "java", "java.util.ArrayList" ).init()
+		var publicKeyType = createObject( "java", "com.webauthn4j.data.PublicKeyCredentialType" ).PUBLIC_KEY
+		for ( var alg in variables.settings.algorithms ) {
+			parameters.add(
+				createObject( "java", "com.webauthn4j.data.PublicKeyCredentialParameters" ).init( publicKeyType, algorithmId( alg ) )
+			)
+		}
+		variables.credentialParameters = parameters
+		variables.allowedOrigins = createObject( "java", "java.util.HashSet" ).init()
+		for ( var origin in variables.settings.origins ) {
+			variables.allowedOrigins.add( originOf( origin ) )
+		}
+		variables.originPredicate = createDynamicProxy( new OriginCheck( this ), [ "com.webauthn4j.server.OriginPredicate" ] )
 		return this
 	}
 
@@ -82,7 +123,7 @@ class {
 			challenge              : newChallenge( arguments.sessionData, "register", userId ),
 			rp                     : { id: variables.settings.rpId, name: variables.settings.rpName },
 			user                   : { id: encode( userId.getBytes( "UTF-8" ) ), name: name, displayName: len( display ) ? display : name },
-			pubKeyCredParams       : variables.settings.algorithms.map( ( alg ) => { return { type: "public-key", alg: val( alg ) } } ),
+			pubKeyCredParams       : variables.settings.algorithms.map( ( alg ) => { return { type: "public-key", alg: alg } } ),
 			timeout                : variables.settings.challengeSeconds * 1000,
 			attestation            : "none",
 			authenticatorSelection : {
@@ -95,10 +136,10 @@ class {
 	}
 
 	/**
-	 * Checks the browser's answer and saves the new passkey; returns its credential struct.
-	 * answer: { id, clientDataJSON, attestationObject?, authenticatorData?, publicKey?,
-	 * publicKeyAlgorithm?, transports?: [], name? }, binary fields base64url. It needs
-	 * attestationObject, or authenticatorData with publicKey and publicKeyAlgorithm.
+	 * Checks the browser's answer and saves the new passkey; returns its credential struct
+	 * with backupEligible and backedUp added. answer: { id, clientDataJSON, attestationObject,
+	 * transports?: [], name?, publicKey?, publicKeyAlgorithm? }, binary
+	 * fields base64url. The key is read from attestationObject; publicKey, when sent, must match it.
 	 * Throws Passkeys.Invalid.
 	 */
 	struct function register( required struct user, required struct sessionData, required struct answer ) {
@@ -108,83 +149,66 @@ class {
 			invalid( "That answer is for another account. Try again." )
 		}
 		var idBytes = decodeField( arguments.answer, "id" )
-		var credentialId = encode( idBytes )
-		checkClientData( decodeField( arguments.answer, "clientDataJSON" ), "webauthn.create", held.value )
-
-		var authData = ""
-		if ( len( arguments.answer.attestationObject ?: "" ) ) {
-			var attestation = variables.cbor.decode( decodeField( arguments.answer, "attestationObject" ) )
-			if ( !isStruct( attestation ) || !isBinary( attestation.authData ?: "" ) ) {
-				invalid( "The authenticator's answer can't be read" )
-			}
-			authData = attestation.authData
-			if ( len( arguments.answer.authenticatorData ?: "" ) && !sameBytes( authData, decodeField( arguments.answer, "authenticatorData" ) ) ) {
-				invalid( "The authenticator's answer doesn't add up" )
-			}
-		} else {
-			authData = decodeField( arguments.answer, "authenticatorData" )
-		}
-		var buffer = checkAuthData( authData )
-		if ( !bitAnd( buffer.get( 32 ), static.FLAG_ATTESTED ) || len( authData ) < 55 ) {
-			invalid( "That passkey came without its key" )
-		}
-		var idLength = createObject( "java", "java.lang.Short" ).toUnsignedInt( buffer.getShort( 53 ) )
-		if ( idLength > static.MAX_CREDENTIAL_ID_BYTES || len( idBytes ) > static.MAX_CREDENTIAL_ID_BYTES ) {
+		if ( arrayLen( idBytes ) > static.MAX_CREDENTIAL_ID_BYTES ) {
 			invalid( "That passkey's id is too long" )
 		}
-		if ( len( authData ) < 55 + idLength || !sameBytes( slice( authData, 55, 55 + idLength ), idBytes ) ) {
-			invalid( "That passkey's id doesn't match" )
-		}
-		// attested credential data must carry the key; the browser's SPKI is only a cross-check
-		if ( len( authData ) <= 55 + idLength ) {
+		var transports = transportsOf( arguments.answer.transports ?: "" )
+		var registration = createObject( "java", "com.webauthn4j.data.RegistrationRequest" ).init(
+			decodeField( arguments.answer, "attestationObject" ),
+			decodeField( arguments.answer, "clientDataJSON" )
+		)
+		var parameters = createObject( "java", "com.webauthn4j.data.RegistrationParameters" ).init(
+			serverProperty( held.value ),
+			variables.credentialParameters,
+			variables.settings.userVerification == "required",
+			true
+		)
+		var data = webauthn( () => static.MANAGER.verify( registration, parameters ) )
+		var authData = data.getAttestationObject().getAuthenticatorData()
+		var attested = authData.getAttestedCredentialData()
+		if ( isNull( attested ) || isNull( attested.getCOSEKey() ) ) {
 			invalid( "That passkey came without its key" )
 		}
-		var coseItem = variables.cbor.decodeAt( authData, 55 + idLength )
-		if ( !isStruct( coseItem.value ) ) {
-			invalid( "That passkey's key can't be read" )
+		if ( !sameBytes( attested.getCredentialId(), idBytes ) ) {
+			invalid( "That passkey's id doesn't match" )
 		}
-		var fromCose = variables.cose.toSpki( coseItem.value )
-		var key = { algorithm: toString( fromCose.algorithm ), spki: encode( fromCose.spki ) }
+		var coseKey = attested.getCOSEKey()
+		var algorithm = isNull( coseKey.getAlgorithm() ) ? 0 : coseKey.getAlgorithm().getValue()
+		if ( !variables.settings.algorithms.contains( algorithm ) ) {
+			invalid( "That passkey uses a kind of key this site doesn't take" )
+		}
+		var spki = coseKey.getPublicKey().getEncoded()
 		if ( len( arguments.answer.publicKey ?: "" ) ) {
-			if ( toString( arguments.answer.publicKeyAlgorithm ?: "" ) != key.algorithm || !sameBytes( decodeField( arguments.answer, "publicKey" ), fromCose.spki ) ) {
+			if ( toString( arguments.answer.publicKeyAlgorithm ?: "" ) != toString( algorithm ) || !sameBytes( decodeField( arguments.answer, "publicKey" ), spki ) ) {
 				invalid( "That passkey's key doesn't match the authenticator's" )
 			}
 		}
-		if ( !variables.settings.algorithms.contains( key.algorithm ) ) {
-			invalid( "That passkey uses a kind of key this site doesn't take" )
-		}
-		publicKeyOf( key.spki, key.algorithm )
 
+		var credentialId = encode( idBytes )
 		var found = variables.store.findByCredentialId( credentialId )
 		if ( !isNull( found ) ) {
 			if ( compare( toString( found.userId ), userId ) != 0 ) {
 				invalid( "That passkey is already in use" )
 			}
-			return found
+			return duplicate( found ).append( { backupEligible: authData.isFlagBE(), backedUp: authData.isFlagBS() } )
 		}
 		if ( variables.settings.maxPerUser > 0 && variables.store.listForUser( userId ).len() >= variables.settings.maxPerUser ) {
 			invalid( "That's as many passkeys as an account can have. Remove one first." )
-		}
-		var transports = []
-		for ( var t in ( isArray( arguments.answer.transports ?: "" ) ? arguments.answer.transports : [] ) ) {
-			if ( transports.len() < static.MAX_TRANSPORTS && isSimpleValue( t ) && reFind( "^[a-z-]{1,20}$", t ) && !transports.contains( t ) ) {
-				transports.append( t )
-			}
 		}
 		var typed = isSimpleValue( arguments.answer.name ?: "" ) ? trim( arguments.answer.name ?: "" ) : ""
 		var credential = {
 			credentialId : credentialId,
 			userId       : userId,
-			publicKey    : key.spki,
-			algorithm    : val( key.algorithm ),
-			signCount    : createObject( "java", "java.lang.Integer" ).toUnsignedLong( buffer.getInt( 33 ) ),
+			publicKey    : encode( spki ),
+			algorithm    : algorithm,
+			signCount    : authData.getSignCount(),
 			transports   : transports,
 			name         : len( typed ) ? left( typed, 100 ) : "Passkey",
 			createdAt    : now(),
 			lastUsedAt   : javacast( "null", "" )
 		}
 		variables.store.add( credential )
-		return credential
+		return duplicate( credential ).append( { backupEligible: authData.isFlagBE(), backedUp: authData.isFlagBS() } )
 	}
 
 	/**
@@ -205,13 +229,14 @@ class {
 
 	/**
 	 * Checks a sign-in answer: { id, clientDataJSON, authenticatorData, signature, userHandle? }
-	 * (base64url). Returns { userId, credentialId, userVerified, signCount, credential }.
-	 * When the options were made for a userId, the passkey must be theirs.
+	 * (base64url). Returns { userId, credentialId, userVerified, backupEligible, backedUp,
+	 * signCount, credential }. When the options were made for a userId, the passkey must be theirs.
 	 * Throws Passkeys.Invalid for anything that doesn't check out.
 	 */
 	struct function verify( required struct sessionData, required struct answer ) {
 		var held = takeChallenge( arguments.sessionData, "sign-in" )
-		var credential = variables.store.findByCredentialId( encode( decodeField( arguments.answer, "id" ) ) )
+		var idBytes = decodeField( arguments.answer, "id" )
+		var credential = variables.store.findByCredentialId( encode( idBytes ) )
 		if ( isNull( credential ) ) {
 			invalid( "That passkey isn't one this site knows. It may have been removed." )
 		}
@@ -219,44 +244,35 @@ class {
 		if ( len( held.userId ) && compare( held.userId, userId ) != 0 ) {
 			invalid( "That passkey belongs to another account" )
 		}
+		var userHandle = javacast( "null", "" )
 		if ( len( arguments.answer.userHandle ?: "" ) ) {
-			var handle = createObject( "java", "java.lang.String" ).init( decodeField( arguments.answer, "userHandle" ), "UTF-8" )
-			if ( compare( handle, userId ) != 0 ) {
+			userHandle = decodeField( arguments.answer, "userHandle" )
+			if ( compare( createObject( "java", "java.lang.String" ).init( userHandle, "UTF-8" ), userId ) != 0 ) {
 				invalid( "That passkey belongs to another account" )
 			}
 		}
-		var clientData = decodeField( arguments.answer, "clientDataJSON" )
-		checkClientData( clientData, "webauthn.get", held.value )
-		var authData = decodeField( arguments.answer, "authenticatorData" )
-		var buffer = checkAuthData( authData )
-
-		var signed = createObject( "java", "java.io.ByteArrayOutputStream" ).init()
-		signed.write( authData )
-		signed.write( sha256( clientData ) )
-		var algorithm = toString( credential.algorithm )
-		if ( !static.SUPPORTED.keyExists( algorithm ) || !variables.settings.algorithms.contains( algorithm ) ) {
+		var algorithm = int( credential.algorithm )
+		if ( !variables.settings.algorithms.contains( algorithm ) ) {
 			invalid( "That passkey uses a kind of key this site doesn't take" )
 		}
-		var check = createObject( "java", "java.security.Signature" ).getInstance( static.SUPPORTED[ algorithm ].signature )
-		check.initVerify( publicKeyOf( credential.publicKey, algorithm ) )
-		check.update( signed.toByteArray() )
-		var good = false
-		try {
-			good = check.verify( decodeField( arguments.answer, "signature" ) )
-		} catch ( "Passkeys.Invalid" e ) {
-			rethrow;
-		} catch ( any e ) {
-			good = false
-		}
-		if ( !good ) {
-			invalid( "That passkey's signature doesn't check out" )
-		}
+		var signIn = createObject( "java", "com.webauthn4j.data.AuthenticationRequest" ).init(
+			idBytes,
+			userHandle,
+			decodeField( arguments.answer, "authenticatorData" ),
+			decodeField( arguments.answer, "clientDataJSON" ),
+			decodeField( arguments.answer, "signature" )
+		)
+		var parameters = createObject( "java", "com.webauthn4j.data.AuthenticationParameters" ).init(
+			serverProperty( held.value ),
+			credentialRecord( idBytes, credential ),
+			javacast( "null", "" ),
+			variables.settings.userVerification == "required",
+			true
+		)
+		var data = webauthn( () => static.MANAGER.verify( signIn, parameters ) )
+		var authData = data.getAuthenticatorData()
 
-		// a counter that doesn't move forward means the key was cloned; most passkeys keep 0
-		var counter = createObject( "java", "java.lang.Integer" ).toUnsignedLong( buffer.getInt( 33 ) )
-		if ( ( counter > 0 || credential.signCount > 0 ) && counter <= credential.signCount ) {
-			invalid( "That passkey looks copied. Remove it and add it again." )
-		}
+		var counter = authData.getSignCount()
 		var usedAt = now()
 		if ( !variables.store.updateUsage( credential.credentialId, counter, usedAt ) ) {
 			invalid( "That passkey looks copied. Remove it and add it again." )
@@ -264,11 +280,13 @@ class {
 		credential.signCount = counter
 		credential.lastUsedAt = usedAt
 		return {
-			userId       : userId,
-			credentialId : credential.credentialId,
-			userVerified : bitAnd( buffer.get( 32 ), static.FLAG_USER_VERIFIED ) > 0,
-			signCount    : counter,
-			credential   : credential
+			userId         : userId,
+			credentialId   : credential.credentialId,
+			userVerified   : authData.isFlagUV(),
+			backupEligible : authData.isFlagBE(),
+			backedUp       : authData.isFlagBS(),
+			signCount      : counter,
+			credential     : credential
 		}
 	}
 
@@ -288,6 +306,113 @@ class {
 			return false
 		}
 		return scheme == "https" || host == "localhost"
+	}
+
+	/** Runs a webauthn4j call, turning what it refuses into Passkeys.Invalid with a message a person can read. */
+	private function webauthn( required function call ) {
+		try {
+			return arguments.call()
+		} catch ( "Passkeys.Invalid" e ) {
+			rethrow;
+		} catch ( any e ) {
+			// the call only reads what the browser sent, so anything else it throws is input it can't parse
+			var reason = reasonFor( e )
+			invalid( len( reason ) ? reason : "The authenticator's answer can't be read" )
+		}
+	}
+
+	/** The message for the first webauthn4j or Jackson refusal in the exception's chain, or "" when there's none. */
+	private string function reasonFor( required e ) {
+		var cause = isInstanceOf( arguments.e, "java.lang.Throwable" ) ? arguments.e : ( arguments.e.cause ?: javacast( "null", "" ) )
+		var depth = 0
+		while ( !isNull( cause ) && depth < 10 ) {
+			var type = cause.getClass()
+			if ( type.getName().startsWith( "tools.jackson." ) ) {
+				return "The authenticator's answer can't be read"
+			}
+			while ( !isNull( type ) && type.getName().startsWith( "com.webauthn4j." ) ) {
+				if ( static.REASONS.keyExists( type.getSimpleName() ) ) {
+					return static.REASONS[ type.getSimpleName() ]
+				}
+				if ( type.getSimpleName() == "VerificationException" ) {
+					return "That passkey's answer doesn't check out"
+				}
+				type = type.getSuperclass()
+			}
+			cause = cause.getCause()
+			depth++
+		}
+		return ""
+	}
+
+	private function serverProperty( required string challenge ) {
+		var builder = createObject( "java", "com.webauthn4j.server.ServerProperty" ).builder()
+			.rpId( variables.settings.rpId )
+			.challenge( createObject( "java", "com.webauthn4j.data.client.challenge.DefaultChallenge" ).init( arguments.challenge ) )
+		if ( variables.allowedOrigins.size() ) {
+			builder.origins( variables.allowedOrigins )
+		} else {
+			builder.originPredicate( variables.originPredicate )
+		}
+		return builder.build()
+	}
+
+	/** A configured origin as webauthn4j's Origin; Passkeys.Configuration unless it's scheme://host[:port] or an Android app origin. */
+	private function originOf( required string origin ) {
+		if ( !reFind( "^(https?://[^/?##\s]+|android:apk-key-hash:[A-Za-z0-9_-]+)$", arguments.origin ) ) {
+			throw( type = "Passkeys.Configuration", message = "The origin '#arguments.origin#' isn't scheme://host[:port]" )
+		}
+		try {
+			return createObject( "java", "com.webauthn4j.data.client.Origin" ).create( arguments.origin )
+		} catch ( any e ) {
+			throw( type = "Passkeys.Configuration", message = "The origin '#arguments.origin#' can't be read" )
+		}
+	}
+
+	/** What webauthn4j needs to check a sign-in, rebuilt from the stored SPKI key. */
+	private function credentialRecord( required idBytes, required struct credential ) {
+		var algorithm = int( arguments.credential.algorithm )
+		var coseKey = ""
+		try {
+			var publicKey = createObject( "java", "java.security.KeyFactory" )
+				.getInstance( algorithm == -8 ? "Ed25519" : ( algorithm == -257 ? "RSA" : "EC" ) )
+				.generatePublic( createObject( "java", "java.security.spec.X509EncodedKeySpec" ).init( decode( arguments.credential.publicKey ) ) )
+			var keyClass = algorithm == -8 ? "EdDSACOSEKey" : ( algorithm == -257 ? "RSACOSEKey" : "EC2COSEKey" )
+			coseKey = createObject( "java", "com.webauthn4j.data.attestation.authenticator.#keyClass#" ).create( publicKey, algorithmId( algorithm ) )
+		} catch ( any e ) {
+			invalid( "That passkey's key on file can't be read" )
+		}
+		var attested = createObject( "java", "com.webauthn4j.data.attestation.authenticator.AttestedCredentialData" ).init(
+			createObject( "java", "com.webauthn4j.data.attestation.authenticator.AAGUID" ).ZERO,
+			arguments.idBytes,
+			coseKey
+		)
+		return createObject( "java", "com.webauthn4j.credential.CredentialRecordImpl" ).init(
+			createObject( "java", "com.webauthn4j.data.attestation.statement.NoneAttestationStatement" ).init(),
+			javacast( "null", "" ),
+			javacast( "null", "" ),
+			javacast( "null", "" ),
+			javacast( "long", arguments.credential.signCount ),
+			attested,
+			javacast( "null", "" ),
+			javacast( "null", "" ),
+			javacast( "null", "" ),
+			javacast( "null", "" )
+		)
+	}
+
+	private function algorithmId( required numeric alg ) {
+		return createObject( "java", "com.webauthn4j.data.attestation.statement.COSEAlgorithmIdentifier" ).create( javacast( "long", arguments.alg ) )
+	}
+
+	private array function transportsOf( required value ) {
+		var transports = []
+		for ( var t in ( isArray( arguments.value ) ? arguments.value : [] ) ) {
+			if ( transports.len() < static.MAX_TRANSPORTS && isSimpleValue( t ) && reFind( "^[a-z-]{1,20}$", t ) && !transports.contains( t ) ) {
+				transports.append( t )
+			}
+		}
+		return transports
 	}
 
 	private struct function descriptor( required struct credential ) {
@@ -349,61 +474,9 @@ class {
 		return "bxPasskeys.challenge." & createObject( "java", "java.lang.System" ).identityHashCode( arguments.sessionData )
 	}
 
-	private void function checkClientData( required clientData, required string type, required string challenge ) {
-		var parsed = {}
-		try {
-			parsed = jsonDeserialize( createObject( "java", "java.lang.String" ).init( arguments.clientData, "UTF-8" ) )
-		} catch ( any e ) {
-			invalid( "The browser's answer can't be read" )
-		}
-		if ( !isStruct( parsed ) || ( parsed.type ?: "" ) != arguments.type ) {
-			invalid( "The browser's answer is for something else" )
-		}
-		if ( compare( parsed.challenge ?: "", arguments.challenge ) != 0 ) {
-			invalid( "That answer is for another try. Try again." )
-		}
-		if ( !isSimpleValue( parsed.origin ?: "" ) || !originAllowed( parsed.origin ?: "" ) ) {
-			invalid( "That passkey was used on another site" )
-		}
-		if ( ( parsed.crossOrigin ?: false ) == true ) {
-			invalid( "That passkey was used inside another site's frame" )
-		}
-	}
-
-	/** A ByteBuffer over authenticatorData once its site, presence and verification check out. */
-	private function checkAuthData( required authData ) {
-		if ( len( arguments.authData ) < 37 ) {
-			invalid( "The authenticator's answer is too short" )
-		}
-		if ( !sameBytes( slice( arguments.authData, 0, 32 ), sha256( variables.settings.rpId.getBytes( "UTF-8" ) ) ) ) {
-			invalid( "That passkey is for another site" )
-		}
-		var buffer = createObject( "java", "java.nio.ByteBuffer" ).wrap( arguments.authData )
-		var flags = buffer.get( 32 )
-		if ( !bitAnd( flags, static.FLAG_USER_PRESENT ) ) {
-			invalid( "The authenticator didn't confirm you were there" )
-		}
-		if ( variables.settings.userVerification == "required" && !bitAnd( flags, static.FLAG_USER_VERIFIED ) ) {
-			invalid( "The authenticator didn't confirm it was you" )
-		}
-		return buffer
-	}
-
-	private function publicKeyOf( required string spki, required string algorithm ) {
-		try {
-			return createObject( "java", "java.security.KeyFactory" )
-				.getInstance( static.SUPPORTED[ arguments.algorithm ].key )
-				.generatePublic( createObject( "java", "java.security.spec.X509EncodedKeySpec" ).init( decode( arguments.spki ) ) )
-		} catch ( "Passkeys.Invalid" e ) {
-			rethrow;
-		} catch ( any e ) {
-			invalid( "That passkey's key can't be read" )
-		}
-	}
-
 	private string function requireField( required struct answer, required string name ) {
 		var value = arguments.answer[ arguments.name ] ?: ""
-		if ( !isSimpleValue( value ) || !len( value ) || len( value ) > 8000 ) {
+		if ( !isSimpleValue( value ) || !len( value ) || len( value ) > static.MAX_FIELD_LENGTH ) {
 			invalid( "The browser's answer is missing #arguments.name#" )
 		}
 		return value
@@ -423,14 +496,6 @@ class {
 
 	private string function encode( required bytes ) {
 		return static.URL_ENCODER.encodeToString( arguments.bytes )
-	}
-
-	private function sha256( required bytes ) {
-		return createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" ).digest( arguments.bytes )
-	}
-
-	private function slice( required bytes, required numeric from, required numeric to ) {
-		return createObject( "java", "java.util.Arrays" ).copyOfRange( arguments.bytes, javacast( "int", arguments.from ), javacast( "int", arguments.to ) )
 	}
 
 	private boolean function sameBytes( required a, required b ) {

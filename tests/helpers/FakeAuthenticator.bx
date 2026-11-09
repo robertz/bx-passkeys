@@ -1,8 +1,8 @@
 /**
  * A passkey authenticator for specs: answers navigator.credentials.create() and
  * .get() options as a browser would (binary fields base64url), with an ES256,
- * Ed25519 or RS256 key. Registration answers carry both attestationObject (fmt
- * "none", COSE key inside) and the SPKI publicKey, so either path can be tested.
+ * Ed25519 or RS256 key. Registration answers carry attestationObject (fmt "none",
+ * COSE key inside) and, as browsers do, the SPKI publicKey and authenticatorData.
  */
 class {
 
@@ -34,6 +34,9 @@ class {
 		variables.origin = arguments.origin
 		variables.rpId = arguments.rpId
 		variables.userHandle = ""
+		variables.flags = 69
+		variables.crossOrigin = false
+		variables.topOrigin = ""
 		return this
 	}
 
@@ -43,8 +46,8 @@ class {
 		variables.userHandle = arguments.options.user.id
 		var data = bytesOf( [
 			sha256( variables.rpId.getBytes( "UTF-8" ) ),
-			// user present and verified, attested credential data follows
-			[ 69 ],
+			// default 69: user present and verified, attested credential data follows
+			[ variables.flags ],
 			int32( variables.counter ),
 			createObject( "java", "java.nio.ByteBuffer" ).allocate( 16 ).array(),
 			int16( arrayLen( id ) ),
@@ -97,6 +100,19 @@ class {
 
 	function setOrigin( required string origin ) {
 		variables.origin = arguments.origin
+		return this
+	}
+
+	/** Answers as from inside a frame on topOrigin. */
+	function setFramed( required string topOrigin ) {
+		variables.crossOrigin = true
+		variables.topOrigin = arguments.topOrigin
+		return this
+	}
+
+	/** The flags byte of registration answers (69; add 8 for backup eligible, 16 for backed up). */
+	function setFlags( required numeric flags ) {
+		variables.flags = arguments.flags
 		return this
 	}
 
@@ -193,7 +209,8 @@ class {
 	}
 
 	private string function clientData( required string type, required string challenge ) {
-		return '{"type":"#arguments.type#","challenge":"#arguments.challenge#","origin":"#variables.origin#","crossOrigin":false}'
+		var extra = len( variables.topOrigin ) ? ',"topOrigin":"#variables.topOrigin#"' : ""
+		return '{"type":"#arguments.type#","challenge":"#arguments.challenge#","origin":"#variables.origin#","crossOrigin":#variables.crossOrigin##extra#}'
 	}
 
 	private function bytesOf( required array parts ) {

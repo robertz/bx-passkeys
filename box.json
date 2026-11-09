@@ -3,7 +3,7 @@
     "version":"0.2.0",
     "author":"Robert Zehnder",
     "slug":"bx-passkeys",
-    "shortDescription":"WebAuthn passkeys for BoxLang: registration and sign-in with JDK crypto only, attestation none.",
+    "shortDescription":"WebAuthn passkeys for BoxLang: registration and sign-in verified by webauthn4j, attestation none.",
     "type":"boxlang-modules",
     "keywords":[
         "boxlang",
@@ -29,13 +29,15 @@
         }
     ],
     "devDependencies":{
-        "testbox":"^7.0.0"
+        "testbox":"^7.0.0",
+        "bx-derby":"^1.1.0"
     },
     "installPaths":{
-        "testbox":"testbox/"
+        "testbox":"testbox/",
+        "bx-derby":"boxlang_modules/bx-derby/"
     },
     "scripts":{
-        "preVersion":"!boxlang run-tests.bxs",
+        "preVersion":"!bash scripts/test.sh",
         "postPublish":"!git push --follow-tags && bash scripts/release.sh"
     },
     "ignore":[

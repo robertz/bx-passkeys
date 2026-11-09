@@ -1,7 +1,7 @@
 /**
  * Registering a passkey and signing in with it, end to end, with the spec
  * suite's FakeAuthenticator standing in for the browser.
- *   boxlang setup-tests.bxs && boxlang examples/flow.bxs
+ *   boxlang setup-tests.bxs && boxlang --bx-home .tmp/bxhome examples/flow.bxs
  */
 rp = passkeyRelyingParty( { rpId: "localhost", rpName: "Example" }, new bxModules.bxPasskeys.models.MemoryCredentialStore() )
 browser = new tests.helpers.FakeAuthenticator( origin = "http://localhost:8080" )

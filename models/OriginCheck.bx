@@ -1,0 +1,16 @@
+/**
+ * webauthn4j's OriginPredicate (a java.util.function.Predicate<Origin>), answered
+ * by RelyingParty.originAllowed() when no fixed origins are configured.
+ */
+class {
+
+	function init( required relyingParty ) {
+		variables.relyingParty = arguments.relyingParty
+		return this
+	}
+
+	boolean function test( required origin ) {
+		return variables.relyingParty.originAllowed( arguments.origin.toString() )
+	}
+
+}

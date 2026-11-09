@@ -1,15 +1,15 @@
 # bx-passkeys
 
-WebAuthn passkeys for BoxLang: let people register a passkey and sign in with it, no password. It uses only JDK crypto (`java.security`), with no third-party jars.
+WebAuthn passkeys for BoxLang: let people register a passkey and sign in with it, no password. Every browser answer is verified by [webauthn4j](https://github.com/webauthn4j/webauthn4j), the WebAuthn library behind Spring Security's and Keycloak's passkey support. The module adds what webauthn4j leaves to you: one-time challenges, the options the browser needs, a credential store, and a sign counter that can't be raced.
 
-- Attestation `"none"`: it trusts the key the authenticator hands over and doesn't check where the authenticator came from. That's what nearly every site wants.
+- Attestation `"none"`: it trusts the key the authenticator hands over and doesn't check where the authenticator came from. That's what nearly every site wants. Attestation statements that do arrive are still checked for consistency.
 - ES256 (P-256), Ed25519 and RS256: the three algorithms browsers actually use.
-- It reads the new key from the browser's `getPublicKey()` (SPKI) or, when that's missing, from the COSE key inside `attestationObject`. A small CBOR decoder is built in.
+- It reports whether a passkey is backup eligible and backed up (synced), so you can tell a synced passkey from a device-bound one.
 - Each challenge is kept in a session struct that you pass in. It works once and expires after `challengeSeconds`.
 - Passkeys live in a **credential store** you choose. A table-backed store and an in-memory store come with the module.
 - Framework-agnostic: there are no routes. You call four methods from your own handlers.
 
-Requires BoxLang **1.19+**.
+Requires BoxLang **1.19+** (Java 21). The module ships its jars in `libs/`: webauthn4j-core 0.32 and Jackson 3, whose `tools.jackson` packages don't clash with the Jackson 2 inside BoxLang. See [Dependencies](#dependencies).
 
 ## Install
 
@@ -22,10 +22,10 @@ box install bx-passkeys              # with CommandBox
 To try a local checkout before it's on ForgeBox (`install-bx-module` only installs from ForgeBox), copy the module's files into your project's `boxlang_modules`:
 
 ```bash
-mkdir -p boxlang_modules/bx-passkeys && cp -R /path/to/bx-passkeys/{ModuleConfig.bx,box.json,bifs,models,client,sql} boxlang_modules/bx-passkeys/
+mkdir -p boxlang_modules/bx-passkeys && cp -R /path/to/bx-passkeys/{ModuleConfig.bx,box.json,bifs,libs,models,client,sql} boxlang_modules/bx-passkeys/
 ```
 
-`box install /path/to/bx-passkeys` also works, but it installs into BoxLang HOME. Run it on a checkout without the `boxlang_modules/` test link (`rm -rf boxlang_modules`), or the copy follows the link back into itself.
+A copy in BoxLang HOME (`~/.boxlang/modules`) wins over one in `./boxlang_modules`, so remove an older install there first.
 
 ## Settings
 
@@ -81,6 +81,8 @@ try {
 }
 ```
 
+`register()` returns the stored credential plus `backupEligible` and `backedUp`.
+
 `user.id` is your app's id for the user, sent to the authenticator as UTF-8 bytes (at most 64). Don't put names or emails in it.
 
 ### Signing in
@@ -92,7 +94,7 @@ return passkeyRelyingParty().signInOptions( session )
 // POST /sign-in/passkey   body = what signWithPasskey() returned
 try {
 	result = passkeyRelyingParty().verify( session, requestBody )
-	// result = { userId, credentialId, userVerified, signCount, credential }
+	// result = { userId, credentialId, userVerified, backupEligible, backedUp, signCount, credential }
 	// sign result.userId in; rotate the session id
 } catch ( "Passkeys.Invalid" e ) {
 	// 401
@@ -126,7 +128,7 @@ Both functions return `null` when the person closes the browser's sheet.
 `examples/flow.bxs` registers a passkey, signs in with it and shows a replay being refused, with the test authenticator standing in for the browser:
 
 ```bash
-box install && boxlang setup-tests.bxs && boxlang examples/flow.bxs
+box install && boxlang setup-tests.bxs && boxlang --bx-home .tmp/bxhome examples/flow.bxs
 ```
 
 ## Credential stores
@@ -152,37 +154,57 @@ To list or remove a user's passkeys in your account settings, call the store dir
 
 ## What it checks
 
-On **registration**:
+webauthn4j verifies, on **registration**:
 
-- The challenge is the one in the session, for registration, still in date, and for the same user. Taking it is locked per session, so one challenge can't be used twice at once.
-- `clientDataJSON` has type `webauthn.create`, an allowed origin, and isn't from a cross-origin frame.
-- `authenticatorData` carries the SHA-256 of the rpId, the user-present flag (and the user-verified flag when that's required), and attested credential data.
-- The credential id matches the one in `authenticatorData` and is at most 1023 bytes. It's stored in canonical base64url, whatever padding the browser sent.
-- `authenticatorData` carries the COSE key, which is one of the accepted algorithms and can be read. When the browser also sends an SPKI key, it must be the same key.
-- The user is still under `maxPerUser`.
-- The passkey isn't already registered to another user.
+- `clientDataJSON` has type `webauthn.create`, the challenge, an allowed origin, and isn't from a cross-origin frame.
+- `attestationObject` parses, its `authenticatorData` carries the SHA-256 of the rpId, the user-present flag (and the user-verified flag when that's required), backup flags that make sense together (backed up only if backup eligible), and attested credential data with a key of one of the accepted `algorithms`.
+- The attestation statement is consistent with its format (`none`, `packed`, `tpm`, `android-key` and the rest). It isn't checked against trust roots.
 
-On **sign-in**, the same challenge, origin, rpId and flag checks apply, plus:
+On **sign-in** it verifies the same client data, rpId and flag checks, plus the signature over `authenticatorData ‖ SHA-256(clientDataJSON)` with the stored key, and that the signature counter moves forward.
 
-- The credential is on file.
-- It belongs to the expected user, if one was given, and matches `userHandle`, if the browser sent one.
-- Its algorithm is still one of the accepted `algorithms`.
-- The signature over `authenticatorData ‖ SHA-256(clientDataJSON)` verifies.
-- The signature counter moves forward, unless it's 0 and always has been (most passkeys always send 0). A counter that stays put, goes backwards or drops to 0 suggests a cloned key. The store saves the new counter only if it's still ahead, so two sign-ins racing with one counter can't both succeed.
+The module itself checks:
 
-Every refusal throws `Passkeys.Invalid` with a message you can show the user. A bad setting throws `Passkeys.Configuration`.
+- The challenge is the one in the session, for this purpose (registration or sign-in), still in date, and for the same user. Taking it is locked per session, so one challenge can't be used twice at once.
+- On registration, the credential id is the one in `authenticatorData` and at most 1023 bytes; it's stored in canonical base64url, whatever padding the browser sent. When the browser also sends an SPKI key, it must be the same key. The user is still under `maxPerUser`, and the passkey isn't already registered to another user.
+- On sign-in, the credential is on file, belongs to the expected user (if one was given), matches `userHandle` (if the browser sent one), and its algorithm is still accepted.
+- The store saves the new counter only while it's still ahead (or both are 0), so two sign-ins racing with one counter can't both succeed. A counter that stays put, goes backwards or drops to 0 suggests a cloned key.
 
-The module doesn't do attestation verification, authenticator metadata (MDS) or any extensions.
+Every refusal throws `Passkeys.Invalid` with a message you can show the user. A bad setting throws `Passkeys.Configuration`. Any other error (a database outage, say) is rethrown as it is.
+
+The module doesn't verify attestation trust chains or authenticator metadata (MDS), and doesn't process extensions. The table doesn't store the backup-eligible flag, so a passkey whose flag changes between registration and sign-in isn't flagged.
+
+## Going to production
+
+- Set `rpId` to your registrable domain and list `origins` exactly, e.g. `[ "https://example.com" ]`. Passkeys can't move to another rpId later, so pick it once.
+- Serve over HTTPS. Browsers allow WebAuthn on plain `http` only for `localhost`.
+- Use `TableCredentialStore` (or your own store) on a real database, with the table from `sql/`. Keep the binary collations on `credential_id` and `user_id`.
+- Rotate the session id after a passkey sign-in (`sessionRotate()`), as after any sign-in.
+- Rate-limit the options and verify endpoints like any sign-in endpoint.
+- Keep a second way in (email link, recovery codes) until people have more than one passkey.
+- Upgrading from 0.2: stored credentials keep working, the table is unchanged.
+
+## Dependencies
+
+`libs/` holds these jars from Maven Central, fetched and checked against Central's SHA-1 by `scripts/fetch-libs.sh`:
+
+| Jar | Version | License |
+|---|---|---|
+| `com.webauthn4j:webauthn4j-core` | 0.32.0.RELEASE | Apache 2.0 |
+| `tools.jackson.core:jackson-databind` | 3.2.4 | Apache 2.0 |
+| `tools.jackson.core:jackson-core` | 3.2.4 | Apache 2.0 |
+| `tools.jackson.dataformat:jackson-dataformat-cbor` | 3.2.4 | Apache 2.0 |
+| `com.fasterxml.jackson.core:jackson-annotations` | 2.22 | Apache 2.0 |
+
+webauthn4j logs through SLF4J, which BoxLang already provides. To update, change the versions in `scripts/fetch-libs.sh`, run it, run the specs, and commit `libs/`.
 
 ## Development
 
 ```bash
-box install                 # TestBox
-boxlang setup-tests.bxs     # once: links boxlang_modules/bxPasskeys to this folder
-boxlang run-tests.bxs
+box install                 # TestBox and bx-derby
+bash scripts/test.sh        # sets up .tmp/bxhome on first run, then runs the specs
 ```
 
-The table-store spec uses an in-memory Derby database, so it needs the `bx-derby` module (`install-bx-module bx-derby`).
+The specs run in a BoxLang home of their own (`.tmp/bxhome`), whose only modules are this checkout and bx-derby, so a bx-passkeys installed in `~/.boxlang/modules` can't stand in for the code under test. The table-store spec uses an in-memory Derby database.
 
 ## License
 
